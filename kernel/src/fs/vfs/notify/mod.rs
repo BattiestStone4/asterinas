@@ -12,7 +12,7 @@ use ostd::sync::RwLock;
 
 use crate::{
     fs::{
-        file::{AccessMode, FileLike, InodeType},
+        file::{AccessMode, FileLike, FsNotifyMode, InodeType},
         vfs::path::Path,
     },
     prelude::*,
@@ -276,7 +276,9 @@ define_atomic_version_of_integer_like_type!(FsEvents, {
 
 /// Notifies that a file was accessed.
 pub fn on_access(file: &Arc<dyn FileLike>) {
-    // TODO: Check fmode flags (FMODE_NONOTIFY, FMODE_NONOTIFY_PERM).
+    if file.fs_notify_mode().contains(FsNotifyMode::NONOTIFY) {
+        return;
+    }
     let path = file.path();
 
     if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
@@ -287,7 +289,9 @@ pub fn on_access(file: &Arc<dyn FileLike>) {
 
 /// Notifies that a file was modified.
 pub fn on_modify(file: &Arc<dyn FileLike>) {
-    // TODO: Check fmode flags (FMODE_NONOTIFY, FMODE_NONOTIFY_PERM).
+    if file.fs_notify_mode().contains(FsNotifyMode::NONOTIFY) {
+        return;
+    }
     let path = file.path();
 
     if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
@@ -379,7 +383,9 @@ pub fn on_create(file_path: &Path, name: impl FnOnce() -> String) {
 
 /// Notifies that a file was opened.
 pub fn on_open(file: &Arc<dyn FileLike>) {
-    // TODO: Check fmode flags (FMODE_NONOTIFY, FMODE_NONOTIFY_PERM).
+    if file.fs_notify_mode().contains(FsNotifyMode::NONOTIFY) {
+        return;
+    }
     let path = file.path();
 
     if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
@@ -390,7 +396,9 @@ pub fn on_open(file: &Arc<dyn FileLike>) {
 
 /// Notifies that a file was closed.
 pub fn on_close(file: &Arc<dyn FileLike>) {
-    // TODO: Check fmode flags (FMODE_NONOTIFY, FMODE_NONOTIFY_PERM).
+    if file.fs_notify_mode().contains(FsNotifyMode::NONOTIFY) {
+        return;
+    }
     let path = file.path();
 
     if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {

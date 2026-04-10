@@ -8,7 +8,9 @@ use core::fmt::Display;
 
 use ostd::io::IoMem;
 
-use super::{AccessMode, InodeHandle, StatusFlags, file_table::FdFlags, inode_handle::SeekFrom};
+use super::{
+    AccessMode, FsNotifyMode, InodeHandle, StatusFlags, file_table::FdFlags, inode_handle::SeekFrom,
+};
 use crate::{
     fs::vfs::{inode::FallocMode, path::Path},
     net::socket::Socket,
@@ -81,6 +83,16 @@ pub trait FileLike: Pollable + Send + Sync + Any {
 
     fn access_mode(&self) -> AccessMode {
         AccessMode::O_RDWR
+    }
+
+    /// Returns the filesystem notification mode for this file.
+    ///
+    /// The default returns an empty `FsNotifyMode`, meaning all
+    /// notifications are enabled. Override this to suppress
+    /// notifications (e.g., `O_PATH` file descriptors return
+    /// `FsNotifyMode::NONOTIFY`).
+    fn fs_notify_mode(&self) -> FsNotifyMode {
+        FsNotifyMode::empty()
     }
 
     fn seek(&self, seek_from: SeekFrom) -> Result<usize> {

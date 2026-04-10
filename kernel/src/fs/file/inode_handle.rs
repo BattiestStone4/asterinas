@@ -7,8 +7,8 @@ use core::{fmt::Display, sync::atomic::Ordering};
 use aster_rights::Rights;
 
 use super::{
-    AccessMode, AtomicStatusFlags, CreationFlags, FileLike, InodeType, Mappable, StatusFlags,
-    file_table::FdFlags, flock::FlockItem,
+    AccessMode, AtomicStatusFlags, CreationFlags, FileLike, FsNotifyMode, InodeType, Mappable,
+    StatusFlags, file_table::FdFlags, flock::FlockItem,
 };
 use crate::{
     events::IoEvents,
@@ -36,6 +36,7 @@ pub struct InodeHandle {
     offset: Mutex<usize>,
     status_flags: AtomicStatusFlags,
     rights: Rights,
+    fs_notify_mode: FsNotifyMode,
 }
 
 impl InodeHandle {
@@ -57,14 +58,14 @@ impl InodeHandle {
         status_flags: StatusFlags,
     ) -> Result<Self> {
         let inode = path.inode();
-        let (file_io, rights) = if status_flags.contains(StatusFlags::O_PATH) {
-            (None, Rights::empty())
+        let (file_io, rights, fs_notify_mode) = if status_flags.contains(StatusFlags::O_PATH) {
+            (None, Rights::empty(), FsNotifyMode::NONOTIFY)
         } else if inode.type_() == InodeType::Dir && access_mode.is_writable() {
             return_errno_with_message!(Errno::EISDIR, "a directory cannot be opened writable");
         } else {
             let file_io = inode.open(access_mode, status_flags).transpose()?;
             let rights = Rights::from(access_mode);
-            (file_io, rights)
+            (file_io, rights, FsNotifyMode::empty())
         };
 
         Ok(Self {
@@ -73,6 +74,7 @@ impl InodeHandle {
             offset: Mutex::new(0),
             status_flags: AtomicStatusFlags::new(status_flags),
             rights,
+            fs_notify_mode,
         })
     }
 
@@ -397,6 +399,10 @@ impl FileLike for InodeHandle {
 
     fn access_mode(&self) -> AccessMode {
         self.rights.into()
+    }
+
+    fn fs_notify_mode(&self) -> FsNotifyMode {
+        self.fs_notify_mode
     }
 
     fn seek(&self, pos: SeekFrom) -> Result<usize> {

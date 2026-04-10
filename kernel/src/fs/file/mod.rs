@@ -12,6 +12,7 @@ mod inode_handle;
 pub use file_attr::{
     access_mode::AccessMode,
     creation_flags::CreationFlags,
+    fs_notify_mode::FsNotifyMode,
     open_args::OpenArgs,
     status_flags::{AtomicStatusFlags, StatusFlags},
 };
