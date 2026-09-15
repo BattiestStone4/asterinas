@@ -12,7 +12,7 @@ use ostd::{
 
 use super::{
     Credentials, Pid, Process, pid_table,
-    posix_thread::{AsPosixThread, PosixThreadBuilder},
+    posix_thread::{AsPosixThread, PosixThreadBuilder, SeccompState},
     rlimit::ResourceLimits,
     signal::{constants::SIGCHLD, sig_disposition::SigDispositions, sig_num::SigNum},
 };
@@ -452,6 +452,7 @@ fn clone_child_task(
         )
         .process(posix_thread.weak_process().clone())
         .sig_mask(sig_mask)
+        .seccomp(SeccompState::new_from(posix_thread.seccomp()))
         .file_table(child_file_table)
         .fs(child_fs)
         .fpu_context(child_fpu_context)
@@ -587,6 +588,7 @@ fn clone_child_process(
                 child_vmar,
             )
             .sig_mask(child_sig_mask)
+            .seccomp(SeccompState::new_from(ctx.posix_thread.seccomp()))
             .file_table(child_file_table)
             .fs(child_fs)
             .fpu_context(child_fpu_context)

@@ -12,7 +12,7 @@ use ostd::{
 };
 use spin::Once;
 
-use super::{PosixThread, ThreadLocal};
+use super::{PosixThread, SeccompState, ThreadLocal};
 use crate::{
     fs::{file::file_table::FileTable, thread_info::ThreadFsInfo},
     prelude::*,
@@ -44,6 +44,7 @@ pub(crate) struct PosixThreadBuilder {
     fs: Option<Arc<ThreadFsInfo>>,
     sig_mask: AtomicSigMask,
     sig_queues: SigQueues,
+    seccomp: SeccompState,
     sched_policy: SchedPolicy,
     supp_user_context: SuppUserContext,
     user_ns: Option<Arc<UserNamespace>>,
@@ -72,6 +73,7 @@ impl PosixThreadBuilder {
             fs: None,
             sig_mask: AtomicSigMask::new_empty(),
             sig_queues: SigQueues::new(),
+            seccomp: SeccompState::new(),
             sched_policy: SchedPolicy::Fair(Nice::default()),
             supp_user_context: SuppUserContext::new(),
             user_ns: None,
@@ -107,6 +109,11 @@ impl PosixThreadBuilder {
 
     pub(crate) fn sig_mask(mut self, sig_mask: AtomicSigMask) -> Self {
         self.sig_mask = sig_mask;
+        self
+    }
+
+    pub(crate) fn seccomp(mut self, seccomp: SeccompState) -> Self {
+        self.seccomp = seccomp;
         self
     }
 
@@ -162,6 +169,7 @@ impl PosixThreadBuilder {
             fs,
             sig_mask,
             sig_queues,
+            seccomp,
             sched_policy,
             supp_user_context,
             user_ns,
@@ -206,6 +214,7 @@ impl PosixThreadBuilder {
                     tracees: Once::new(),
                     exit_code: AtomicU32::new(0),
                     personality: AtomicU32::new(0),
+                    seccomp,
                 }
             };
 

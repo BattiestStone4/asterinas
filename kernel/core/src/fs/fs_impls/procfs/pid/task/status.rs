@@ -197,6 +197,7 @@ impl ProcFileOps for StatusFileOps {
             "CapAmb:\t{:016x}",
             credentials.ambient_capset().bits()
         )?;
+        writeln!(printer, "Seccomp:\t{}", posix_thread.seccomp().mode() as u8)?;
 
         Ok(printer.bytes_written())
     }

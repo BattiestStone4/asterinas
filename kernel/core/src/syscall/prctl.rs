@@ -2,12 +2,12 @@
 
 use ostd::mm::VmIo;
 
-use super::SyscallReturn;
+use super::{SyscallReturn, seccomp::set_mode};
 use crate::{
     prelude::*,
     process::{
         credentials::{SecureBits, capabilities::CapSet},
-        posix_thread::{ContextPthreadAdminApi, ThreadName},
+        posix_thread::{ContextPthreadAdminApi, SeccompMode, ThreadName},
         signal::sig_num::SigNum,
     },
 };
@@ -71,6 +71,14 @@ pub(super) fn sys_prctl(
             let thread_name = ctx.posix_thread.thread_name().lock();
             ctx.user_space()
                 .write_bytes(write_to_addr, thread_name.as_bytes_with_nul())?;
+        }
+        PrctlCmd::PR_GET_SECCOMP => {
+            return Ok(SyscallReturn::Return(
+                ctx.posix_thread.seccomp().mode() as u8 as isize,
+            ));
+        }
+        PrctlCmd::PR_SET_SECCOMP(mode) => {
+            set_mode(mode, ctx)?;
         }
         PrctlCmd::PR_CAPBSET_READ(capability) => {
             let credentials = ctx.posix_thread.credentials();
@@ -159,6 +167,8 @@ const PR_GET_KEEPCAPS: i32 = 7;
 const PR_SET_KEEPCAPS: i32 = 8;
 const PR_SET_NAME: i32 = 15;
 const PR_GET_NAME: i32 = 16;
+const PR_GET_SECCOMP: i32 = 21;
+const PR_SET_SECCOMP: i32 = 22;
 const PR_CAPBSET_READ: i32 = 23;
 const PR_CAPBSET_DROP: i32 = 24;
 const PR_GET_SECUREBITS: i32 = 27;
@@ -171,6 +181,14 @@ const PR_SET_NO_NEW_PRIVS: i32 = 38;
 const PR_GET_NO_NEW_PRIVS: i32 = 39;
 const PR_CAP_AMBIENT: i32 = 47;
 
+/// The seccomp modes that `PR_SET_SECCOMP` accepts, as defined by
+/// `<linux/seccomp.h>`.
+///
+/// They select the same modes as the operations of `seccomp(2)`, but are a
+/// separate namespace: `PR_SET_SECCOMP` predates `seccomp(2)`.
+const SECCOMP_MODE_STRICT: u64 = 1;
+const SECCOMP_MODE_FILTER: u64 = 2;
+
 #[expect(non_camel_case_types)]
 #[derive(Clone, Copy, Debug)]
 enum PrctlCmd {
@@ -182,6 +200,8 @@ enum PrctlCmd {
     PR_SET_KEEPCAPS(u32),
     PR_SET_NAME(Vaddr),
     PR_GET_NAME(Vaddr),
+    PR_GET_SECCOMP,
+    PR_SET_SECCOMP(SeccompMode),
     PR_CAPBSET_READ(CapSet),
     PR_CAPBSET_DROP(CapSet),
     PR_GET_SECUREBITS,
@@ -225,6 +245,19 @@ impl PrctlCmd {
             PR_SET_KEEPCAPS => Ok(PrctlCmd::PR_SET_KEEPCAPS(arg2 as _)),
             PR_SET_NAME => Ok(PrctlCmd::PR_SET_NAME(arg2 as _)),
             PR_GET_NAME => Ok(PrctlCmd::PR_GET_NAME(arg2 as _)),
+            PR_GET_SECCOMP => Ok(PrctlCmd::PR_GET_SECCOMP),
+            PR_SET_SECCOMP => {
+                // `arg3` is a pointer to a BPF program in the filter mode. It
+                // is ignored in the strict mode, as it is in Linux.
+                let mode = match arg2 {
+                    SECCOMP_MODE_STRICT => SeccompMode::Strict,
+                    SECCOMP_MODE_FILTER => SeccompMode::Filter,
+                    _ => {
+                        return_errno_with_message!(Errno::EINVAL, "unknown seccomp mode");
+                    }
+                };
+                Ok(PrctlCmd::PR_SET_SECCOMP(mode))
+            }
             PR_CAPBSET_READ => Ok(PrctlCmd::PR_CAPBSET_READ(parse_capability(arg2)?)),
             PR_CAPBSET_DROP => Ok(PrctlCmd::PR_CAPBSET_DROP(parse_capability(arg2)?)),
             PR_GET_SECUREBITS => Ok(PrctlCmd::PR_GET_SECUREBITS),

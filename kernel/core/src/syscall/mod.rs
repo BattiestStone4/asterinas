@@ -15,7 +15,15 @@ pub(crate) use clock_gettime::ClockId;
 use ostd::arch::cpu::context::UserContext;
 pub(crate) use timer_create::create_timer_for_clock;
 
-use crate::{cpu::LinuxAbi, prelude::*};
+use crate::{
+    cpu::LinuxAbi,
+    prelude::*,
+    process::{
+        TermStatus,
+        posix_thread::{SeccompMode, do_exit},
+        signal::constants::SIGKILL,
+    },
+};
 
 #[cfg_attr(target_arch = "x86_64", path = "arch/x86.rs")]
 #[cfg_attr(target_arch = "riscv64", path = "arch/riscv.rs")]
@@ -144,6 +152,7 @@ mod sched_setattr;
 mod sched_setparam;
 mod sched_setscheduler;
 mod sched_yield;
+mod seccomp;
 mod select;
 mod semctl;
 mod semget;
@@ -383,6 +392,22 @@ impl SyscallArgument {
 
 pub(crate) fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
     let syscall_frame = SyscallArgument::new_from_context(user_ctx);
+
+    if ctx.posix_thread.seccomp().mode() == SeccompMode::Strict
+        && !is_allowed_in_strict_mode(syscall_frame.syscall_number)
+    {
+        debug!(
+            "seccomp: the strict mode forbids the syscall {}",
+            syscall_frame.syscall_number
+        );
+
+        // The thread is terminated on the spot, as Linux does with
+        // `do_exit(SIGKILL)`. Note that, unlike Linux's, our `do_exit` returns,
+        // so the forbidden system call must not be dispatched afterwards.
+        do_exit(TermStatus::Killed(SIGKILL), ctx, user_ctx);
+        return;
+    }
+
     let syscall_return = arch::syscall_dispatch(
         syscall_frame.syscall_number,
         syscall_frame.args,
@@ -402,6 +427,26 @@ pub(crate) fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
             user_ctx.set_syscall_ret((-errno) as usize)
         }
     }
+}
+
+/// Returns whether `syscall_number` may be made while the seccomp strict mode is
+/// in effect.
+///
+/// Following the seccomp(2) manual page, the strict mode allows only `read(2)`,
+/// `write(2)`, `_exit(2)` and `sigreturn(2)`. Their numbers are taken from the
+/// architecture's syscall table instead of being hard-coded, because the system
+/// call that returns from a signal handler differs between architectures: it is
+/// `rt_sigreturn(2)` on every architecture that Asterinas supports, and only on
+/// 32-bit x86 is it `sigreturn(2)` proper. Linux keeps the set behind the
+/// `__NR_seccomp_*` macros for the same reason.
+///
+/// Note that the strict mode is an allowlist of system call numbers only; it
+/// does not inspect the arguments of the calls that it lets through.
+fn is_allowed_in_strict_mode(syscall_number: u64) -> bool {
+    matches!(
+        syscall_number,
+        arch::SYS_READ | arch::SYS_WRITE | arch::SYS_EXIT | arch::SYS_RT_SIGRETURN
+    )
 }
 
 macro_rules! log_syscall_entry {

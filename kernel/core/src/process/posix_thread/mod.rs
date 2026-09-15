@@ -37,6 +37,7 @@ mod personality;
 mod posix_thread_ext;
 pub(crate) mod ptrace;
 mod robust_list;
+mod seccomp;
 mod thread_local;
 
 pub(crate) use builder::PosixThreadBuilder;
@@ -45,6 +46,7 @@ pub(crate) use exit::{do_exit, do_exit_group};
 pub(crate) use personality::Personality;
 pub(crate) use posix_thread_ext::AsPosixThread;
 pub(crate) use robust_list::RobustListHead;
+pub(crate) use seccomp::{SeccompMode, SeccompState};
 pub(crate) use thread_local::{AsThreadLocal, FileTableRefMut, ThreadLocal};
 
 pub(crate) struct PosixThread {
@@ -106,6 +108,9 @@ pub(crate) struct PosixThread {
 
     /// The personality value for this thread.
     personality: AtomicU32,
+
+    /// The seccomp state of this thread.
+    seccomp: SeccompState,
 }
 
 impl PosixThread {
