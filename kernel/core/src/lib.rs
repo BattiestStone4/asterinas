@@ -54,6 +54,7 @@ mod net;
 mod prelude;
 mod process;
 mod sched;
+mod seccomp;
 mod security;
 mod syscall;
 mod thread;

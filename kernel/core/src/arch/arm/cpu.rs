@@ -14,6 +14,12 @@ use crate::{
     vm::{perms::VmPerms, vmar::PageFaultInfo},
 };
 
+/// The architecture as a seccomp filter sees it: the `AUDIT_ARCH_AARCH64` value,
+/// which is `EM_AARCH64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE`.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/include/uapi/linux/audit.h>.
+pub(crate) const AUDIT_ARCH: u32 = 0xc000_00b7;
+
 impl LinuxAbi for UserContext {
     fn syscall_num(&self) -> usize {
         self.x8()

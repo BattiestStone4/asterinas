@@ -12,7 +12,7 @@ use ostd::{
 
 use super::{
     Credentials, Pid, Process, pid_table,
-    posix_thread::{AsPosixThread, PosixThreadBuilder, SeccompState},
+    posix_thread::{AsPosixThread, PosixThreadBuilder},
     rlimit::ResourceLimits,
     signal::{constants::SIGCHLD, sig_disposition::SigDispositions, sig_num::SigNum},
 };
@@ -32,6 +32,7 @@ use crate::{
         stats::PROCESS_CREATION_COUNTER,
     },
     sched::Nice,
+    seccomp::SeccompState,
     thread::{AsThread, Tid},
     vm::vmar::{Vmar, VmarHandle},
 };

@@ -2,12 +2,15 @@
 
 use ostd::mm::VmIo;
 
-use super::{SyscallReturn, seccomp::set_mode};
+use super::{
+    SyscallReturn,
+    seccomp::{enter_strict_mode, install_filter},
+};
 use crate::{
     prelude::*,
     process::{
         credentials::{SecureBits, capabilities::CapSet},
-        posix_thread::{ContextPthreadAdminApi, SeccompMode, ThreadName},
+        posix_thread::{ContextPthreadAdminApi, ThreadName},
         signal::sig_num::SigNum,
     },
 };
@@ -77,8 +80,13 @@ pub(super) fn sys_prctl(
                 ctx.posix_thread.seccomp().mode() as u8 as isize,
             ));
         }
-        PrctlCmd::PR_SET_SECCOMP(mode) => {
-            set_mode(mode, ctx)?;
+        PrctlCmd::PR_SET_SECCOMP_STRICT => {
+            enter_strict_mode(ctx)?;
+        }
+        PrctlCmd::PR_SET_SECCOMP_FILTER(filter) => {
+            // `PR_SET_SECCOMP` predates the filter flags, so it has none, as
+            // Linux notes when it forwards to `do_seccomp`.
+            install_filter(ctx, 0, filter)?;
         }
         PrctlCmd::PR_CAPBSET_READ(capability) => {
             let credentials = ctx.posix_thread.credentials();
@@ -201,7 +209,12 @@ enum PrctlCmd {
     PR_SET_NAME(Vaddr),
     PR_GET_NAME(Vaddr),
     PR_GET_SECCOMP,
-    PR_SET_SECCOMP(SeccompMode),
+    /// `PR_SET_SECCOMP` with `SECCOMP_MODE_STRICT`, whose third argument it
+    /// ignores.
+    PR_SET_SECCOMP_STRICT,
+    /// `PR_SET_SECCOMP` with `SECCOMP_MODE_FILTER`, whose third argument is a
+    /// pointer to the program to install.
+    PR_SET_SECCOMP_FILTER(Vaddr),
     PR_CAPBSET_READ(CapSet),
     PR_CAPBSET_DROP(CapSet),
     PR_GET_SECUREBITS,
@@ -247,16 +260,16 @@ impl PrctlCmd {
             PR_GET_NAME => Ok(PrctlCmd::PR_GET_NAME(arg2 as _)),
             PR_GET_SECCOMP => Ok(PrctlCmd::PR_GET_SECCOMP),
             PR_SET_SECCOMP => {
-                // `arg3` is a pointer to a BPF program in the filter mode. It
-                // is ignored in the strict mode, as it is in Linux.
-                let mode = match arg2 {
-                    SECCOMP_MODE_STRICT => SeccompMode::Strict,
-                    SECCOMP_MODE_FILTER => SeccompMode::Filter,
+                // `arg3` is a pointer to the BPF program to install in the
+                // filter mode, and is ignored in the strict mode, as it is in
+                // Linux.
+                match arg2 {
+                    SECCOMP_MODE_STRICT => Ok(PrctlCmd::PR_SET_SECCOMP_STRICT),
+                    SECCOMP_MODE_FILTER => Ok(PrctlCmd::PR_SET_SECCOMP_FILTER(arg3 as Vaddr)),
                     _ => {
                         return_errno_with_message!(Errno::EINVAL, "unknown seccomp mode");
                     }
-                };
-                Ok(PrctlCmd::PR_SET_SECCOMP(mode))
+                }
             }
             PR_CAPBSET_READ => Ok(PrctlCmd::PR_CAPBSET_READ(parse_capability(arg2)?)),
             PR_CAPBSET_DROP => Ok(PrctlCmd::PR_CAPBSET_DROP(parse_capability(arg2)?)),

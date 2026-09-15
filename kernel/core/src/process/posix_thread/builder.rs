@@ -12,7 +12,8 @@ use ostd::{
 };
 use spin::Once;
 
-use super::{PosixThread, SeccompState, ThreadLocal};
+use super::{PosixThread, ThreadLocal};
+use crate::seccomp::SeccompState;
 use crate::{
     fs::{file::file_table::FileTable, thread_info::ThreadFsInfo},
     prelude::*,

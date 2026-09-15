@@ -24,6 +24,7 @@ use crate::{
         posix_thread::ptrace::TraceeStatus,
         signal::{PauseReason, PollHandle, sig_mask::SigMask},
     },
+    seccomp::SeccompState,
     thread::{Thread, Tid},
     time::{Timer, TimerManager, clocks::ProfClock, timer::TimerGuard},
 };
@@ -37,7 +38,6 @@ mod personality;
 mod posix_thread_ext;
 pub(crate) mod ptrace;
 mod robust_list;
-mod seccomp;
 mod thread_local;
 
 pub(crate) use builder::PosixThreadBuilder;
@@ -46,7 +46,6 @@ pub(crate) use exit::{do_exit, do_exit_group};
 pub(crate) use personality::Personality;
 pub(crate) use posix_thread_ext::AsPosixThread;
 pub(crate) use robust_list::RobustListHead;
-pub(crate) use seccomp::{SeccompMode, SeccompState};
 pub(crate) use thread_local::{AsThreadLocal, FileTableRefMut, ThreadLocal};
 
 pub(crate) struct PosixThread {
@@ -305,6 +304,11 @@ impl PosixThread {
     /// Gets the read-only credentials of the thread.
     pub(crate) fn credentials(&self) -> Credentials<ReadOp> {
         self.credentials.dup().restrict()
+    }
+
+    /// Gets the seccomp state of the thread.
+    pub(crate) fn seccomp(&self) -> &SeccompState {
+        &self.seccomp
     }
 
     /// Gets the duplicatable read-only credentials of the thread.

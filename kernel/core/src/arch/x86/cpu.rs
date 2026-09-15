@@ -32,6 +32,12 @@ use crate::{
 const SIGRETURN_RFLAGS_MASK: usize =
     USER_MODIFIABLE_RFLAGS & !(RFlags::NESTED_TASK.bits() as usize);
 
+/// The architecture as a seccomp filter sees it: the `AUDIT_ARCH_X86_64` value,
+/// which is `EM_X86_64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE`.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/include/uapi/linux/audit.h>.
+pub(crate) const AUDIT_ARCH: u32 = 0xc000_003e;
+
 impl LinuxAbi for UserContext {
     fn syscall_num(&self) -> usize {
         self.rax()

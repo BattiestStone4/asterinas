@@ -12,17 +12,19 @@
 )]
 
 pub(crate) use clock_gettime::ClockId;
-use ostd::arch::cpu::context::UserContext;
+use ostd::{arch::cpu::context::UserContext, user::UserContextApi};
 pub(crate) use timer_create::create_timer_for_clock;
 
 use crate::{
+    arch::cpu::AUDIT_ARCH,
     cpu::LinuxAbi,
     prelude::*,
     process::{
         TermStatus,
-        posix_thread::{SeccompMode, do_exit},
-        signal::constants::SIGKILL,
+        posix_thread::{do_exit, do_exit_group},
+        signal::constants::{SIGKILL, SIGSYS},
     },
+    seccomp::{SeccompAction, SeccompData, SeccompMode},
 };
 
 #[cfg_attr(target_arch = "x86_64", path = "arch/x86.rs")]
@@ -393,18 +395,7 @@ impl SyscallArgument {
 pub(crate) fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
     let syscall_frame = SyscallArgument::new_from_context(user_ctx);
 
-    if ctx.posix_thread.seccomp().mode() == SeccompMode::Strict
-        && !is_allowed_in_strict_mode(syscall_frame.syscall_number)
-    {
-        debug!(
-            "seccomp: the strict mode forbids the syscall {}",
-            syscall_frame.syscall_number
-        );
-
-        // The thread is terminated on the spot, as Linux does with
-        // `do_exit(SIGKILL)`. Note that, unlike Linux's, our `do_exit` returns,
-        // so the forbidden system call must not be dispatched afterwards.
-        do_exit(TermStatus::Killed(SIGKILL), ctx, user_ctx);
+    if !seccomp_allows(ctx, user_ctx, &syscall_frame) {
         return;
     }
 
@@ -425,6 +416,99 @@ pub(crate) fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
             debug!("syscall return error: {:?}", err);
             let errno = err.error() as i32;
             user_ctx.set_syscall_ret((-errno) as usize)
+        }
+    }
+}
+
+/// Applies the seccomp restrictions of the calling thread to the system call it
+/// is making, and returns whether the system call may go ahead.
+///
+/// By the time this returns `false`, the restriction has already been carried
+/// out: an `errno` has been placed in the system call's return value, and a
+/// kill has terminated either the thread or its whole process. Both of the
+/// kills, like [`do_exit`], return, so the caller must not dispatch the system
+/// call afterwards — which is exactly what the return value says.
+fn seccomp_allows(
+    ctx: &Context,
+    user_ctx: &mut UserContext,
+    syscall_frame: &SyscallArgument,
+) -> bool {
+    match ctx.posix_thread.seccomp().mode() {
+        SeccompMode::Disabled => true,
+
+        SeccompMode::Strict => {
+            if is_allowed_in_strict_mode(syscall_frame.syscall_number) {
+                return true;
+            }
+
+            debug!(
+                "seccomp: the strict mode forbids the syscall {}",
+                syscall_frame.syscall_number
+            );
+
+            // The thread is terminated on the spot, as Linux does with
+            // `do_exit(SIGKILL)`. Note that, unlike Linux's, our `do_exit`
+            // returns, so the forbidden system call must not be dispatched
+            // afterwards.
+            do_exit(TermStatus::Killed(SIGKILL), ctx, user_ctx);
+            false
+        }
+
+        SeccompMode::Filter => {
+            // This is everything a filter is allowed to see of the system call,
+            // which is what keeps one from reaching into the kernel: it is given
+            // numbers, never objects.
+            let data = SeccompData {
+                nr: syscall_frame.syscall_number as i32,
+                arch: AUDIT_ARCH,
+                instruction_pointer: user_ctx.instruction_pointer() as u64,
+                args: syscall_frame.args,
+            };
+
+            let verdict = ctx.posix_thread.seccomp().run_filters(&data);
+
+            match SeccompAction::from_verdict(verdict) {
+                SeccompAction::Allow => true,
+
+                SeccompAction::Errno(errno) => {
+                    debug!(
+                        "seccomp: the filter refuses the syscall {} with errno {}",
+                        syscall_frame.syscall_number, errno
+                    );
+
+                    // The system call is not dispatched at all. The error number
+                    // the filter chose is returned in its place, as a negative
+                    // number, which is how a system call reports failure.
+                    user_ctx.set_syscall_ret(-(errno as isize) as usize);
+                    false
+                }
+
+                SeccompAction::KillThread => {
+                    debug!(
+                        "seccomp: the filter kills the thread over the syscall {}",
+                        syscall_frame.syscall_number
+                    );
+
+                    // Note the signal: a filter kills with `SIGSYS`, where the
+                    // strict mode above kills with `SIGKILL`. Linux makes the
+                    // same distinction. Neither signal is catchable, whichever
+                    // verdict asked for the kill; a filter that wants a
+                    // catchable `SIGSYS` has to ask for `SECCOMP_RET_TRAP`,
+                    // which is a later stage of the work.
+                    do_exit(TermStatus::Killed(SIGSYS), ctx, user_ctx);
+                    false
+                }
+
+                SeccompAction::KillProcess => {
+                    debug!(
+                        "seccomp: the filter kills the process over the syscall {}",
+                        syscall_frame.syscall_number
+                    );
+
+                    do_exit_group(TermStatus::Killed(SIGSYS), ctx, user_ctx);
+                    false
+                }
+            }
         }
     }
 }
