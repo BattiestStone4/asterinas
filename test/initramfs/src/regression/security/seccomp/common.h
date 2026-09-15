@@ -20,10 +20,92 @@
  * `sigreturn(2)`. */
 #define SECCOMP_SET_MODE_STRICT 0
 
+/* Installs a classic-BPF program that filters the system calls of the thread. */
+#define SECCOMP_SET_MODE_FILTER 1
+
+/* Asks whether an action is available. Its argument is a pointer to the action
+ * to ask about. */
+#define SECCOMP_GET_ACTION_AVAIL 2
+
 /* Older versions of `<sys/syscall.h>` may not define this. */
 #ifndef SYS_seccomp
 #define SYS_seccomp 317
 #endif
+
+/*
+ * The seccomp ABI, restated.
+ *
+ * `<linux/filter.h>` and `<linux/seccomp.h>` are not available in every build
+ * environment, so the few definitions that the tests need are repeated here.
+ * They are part of the interface with the kernel, and a change to any of them
+ * is a change to the ABI rather than to these tests.
+ */
+
+/* What a filter asks to happen to a system call. The high half of a verdict
+ * names the action and the low half carries data for it. */
+#define SECCOMP_RET_KILL_PROCESS 0x80000000U
+#define SECCOMP_RET_KILL_THREAD 0x00000000U
+#define SECCOMP_RET_ERRNO 0x00050000U
+#define SECCOMP_RET_ALLOW 0x7fff0000U
+#define SECCOMP_RET_DATA 0x0000ffffU
+
+/* The largest program a filter may be, in instructions. */
+#define BPF_MAXINSNS 4096
+
+/* The offsets of the fields of `struct seccomp_data`, which is what a filter is
+ * given to inspect. The system call number comes first, then the architecture,
+ * then the instruction pointer, and the six arguments last. */
+#define SECCOMP_DATA_NR_OFFSET 0
+#define SECCOMP_DATA_ARCH_OFFSET 4
+#define SECCOMP_DATA_ARGS_OFFSET 16
+
+/* One classic-BPF instruction, and a program as userspace describes it. */
+struct sock_filter {
+	unsigned short code;
+	unsigned char jt;
+	unsigned char jf;
+	unsigned int k;
+};
+
+struct sock_fprog {
+	unsigned short len;
+	struct sock_filter *filter;
+};
+
+/* The instruction encodings used by the tests. A full classic-BPF opcode is a
+ * class, a size, a mode and an operation, so they are spelled out rather than
+ * written as literals. */
+#define BPF_LD 0x00
+#define BPF_W 0x00
+#define BPF_ABS 0x20
+#define BPF_JMP 0x05
+#define BPF_JEQ 0x10
+#define BPF_K 0x00
+#define BPF_RET 0x06
+
+#define BPF_STMT(code, k)                                       \
+	{                                                       \
+		(unsigned short)(code), 0, 0, (unsigned int)(k) \
+	}
+#define BPF_JUMP(code, k, jt, jf)                                     \
+	{                                                             \
+		(unsigned short)(code), (jt), (jf), (unsigned int)(k) \
+	}
+
+/**
+ * Installs `program` as a filter on the calling thread.
+ *
+ * Returns 0 on success and -1 with `errno` set otherwise, as `seccomp(2)` does.
+ * The caller must have set `no_new_privs` first, or the installation will be
+ * refused with `EACCES`.
+ */
+static inline long install_filter(struct sock_filter *program,
+				  unsigned short len, unsigned int flags)
+{
+	struct sock_fprog fprog = { .len = len, .filter = program };
+
+	return syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, flags, &fprog);
+}
 
 /**
  * Skips the current test if the test process is already confined by a seccomp
