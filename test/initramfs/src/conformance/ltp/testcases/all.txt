@@ -1322,7 +1322,7 @@ sched_yield01
 # sched_getattr01
 # sched_getattr02
 
-# seccomp01
+seccomp01
 
 select01
 # select02
