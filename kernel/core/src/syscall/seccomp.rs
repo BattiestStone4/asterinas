@@ -83,18 +83,12 @@ pub(super) fn sys_seccomp(
             // answer is simply that it is not available.
             let action = ctx.user_space().read_val::<u32>(args)?;
             if !AVAILABLE_ACTIONS.contains(&action) {
-                return_errno_with_message!(
-                    Errno::EOPNOTSUPP,
-                    "the action is not available"
-                );
+                return_errno_with_message!(Errno::EOPNOTSUPP, "the action is not available");
             }
         }
         SECCOMP_GET_NOTIF_SIZES => {
             if flags != 0 {
-                return_errno_with_message!(
-                    Errno::EINVAL,
-                    "SECCOMP_GET_NOTIF_SIZES takes no flags"
-                );
+                return_errno_with_message!(Errno::EINVAL, "SECCOMP_GET_NOTIF_SIZES takes no flags");
             }
 
             // The notification structures are part of the user-notification
@@ -129,8 +123,8 @@ pub(crate) fn enter_strict_mode(ctx: &Context) -> Result<()> {
 ///
 /// The order in which this can fail is the one Linux uses: the flags first, then
 /// the program description as it is read out of user memory, then the length of
-/// the program, then the requirement of `no_new_privs`, and only then the
-/// program itself.
+/// the program, then the permission to install one, and only then the program
+/// itself.
 pub(crate) fn install_filter(ctx: &Context, flags: u32, fprog_addr: Vaddr) -> Result<()> {
     if flags & !SUPPORTED_FILTER_FLAGS != 0 {
         // The flag that a sandbox runtime passes and that it is most important
@@ -138,10 +132,7 @@ pub(crate) fn install_filter(ctx: &Context, flags: u32, fprog_addr: Vaddr) -> Re
         // it is the one that would otherwise believe the whole thread group is
         // confined.
         if flags & SECCOMP_FILTER_FLAG_TSYNC != 0 {
-            return_errno_with_message!(
-                Errno::EINVAL,
-                "SECCOMP_FILTER_FLAG_TSYNC is not supported"
-            );
+            return_errno_with_message!(Errno::EINVAL, "SECCOMP_FILTER_FLAG_TSYNC is not supported");
         }
         return_errno_with_message!(Errno::EINVAL, "the filter flags are not supported");
     }
@@ -159,12 +150,14 @@ pub(crate) fn install_filter(ctx: &Context, flags: u32, fprog_addr: Vaddr) -> Re
 
     // Installing a filter confines the calls that children will be able to make,
     // which is not something that a process may decide for one that has more
-    // privileges than it has. `no_new_privs` is a promise that the process will
-    // not gain any, so a process that has made it may be confined.
-    if !ctx.posix_thread.credentials().no_new_privs() {
+    // privileges than it has. There are two ways to be allowed to do it: by
+    // making `no_new_privs`, a promise that the process will not gain any
+    // privileges, or by holding `CAP_SYS_ADMIN`, which is the privilege to
+    // decide this for other processes in the first place.
+    if !ctx.posix_thread.credentials().no_new_privs() && !holds_sys_admin(ctx) {
         return_errno_with_message!(
             Errno::EACCES,
-            "installing a filter requires no_new_privs"
+            "installing a filter requires no_new_privs or CAP_SYS_ADMIN"
         );
     }
 
@@ -172,6 +165,25 @@ pub(crate) fn install_filter(ctx: &Context, flags: u32, fprog_addr: Vaddr) -> Re
     let program = verify(program)?;
 
     ctx.posix_thread.seccomp().attach_filter(program)
+}
+
+/// Returns whether the calling thread holds `CAP_SYS_ADMIN` over its user
+/// namespace.
+///
+/// The question is put to the LSM hooks rather than to the credential set
+/// directly, so that a security module gets its say. A denial is reported as a
+/// plain "no" rather than as the module's error, because the caller has an
+/// answer of its own to give for it (`EACCES`, as on Linux) and does not care
+/// which check turned it down.
+fn holds_sys_admin(ctx: &Context) -> bool {
+    use crate::{process::credentials::capabilities::CapSet, security::lsm::hooks as lsm_hooks};
+
+    lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+        ctx.thread_local.borrow_user_ns().as_ref(),
+        ctx.posix_thread,
+        CapSet::SYS_ADMIN,
+    ))
+    .is_ok()
 }
 
 /// Reads the `len` instructions of the filter program at `addr` out of user
