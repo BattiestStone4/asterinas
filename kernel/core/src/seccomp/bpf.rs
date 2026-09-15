@@ -145,56 +145,25 @@ pub(super) const RET_A: u16 = BPF_RET | BPF_A;
 /// halfword and byte reads, the multi-byte load and every `BPF_MSH` are all
 /// rejected. So is `BPF_MOD`, whose classic and extended semantics disagree.
 /// This is exactly the set Linux's `seccomp_check_filter()` accepts.
+#[rustfmt::skip]
 pub(super) const ALLOWED_OPCODES: [u16; 41] = [
     // Reading the system call the filter is inspecting.
-    LD_W_ABS,
-    LD_W_LEN,
-    LDX_W_LEN,
+    LD_W_ABS, LD_W_LEN, LDX_W_LEN,
     // Constants.
-    LD_IMM,
-    LDX_IMM,
+    LD_IMM, LDX_IMM,
     // Scratch memory.
-    LD_MEM,
-    LDX_MEM,
-    ST,
-    STX,
+    LD_MEM, LDX_MEM, ST, STX,
     // Moving a value between the two registers.
-    TAX,
-    TXA,
+    TAX, TXA,
     // Arithmetic and logic.
-    ALU_ADD_K,
-    ALU_ADD_X,
-    ALU_SUB_K,
-    ALU_SUB_X,
-    ALU_MUL_K,
-    ALU_MUL_X,
-    ALU_DIV_K,
-    ALU_DIV_X,
-    ALU_OR_K,
-    ALU_OR_X,
-    ALU_AND_K,
-    ALU_AND_X,
-    ALU_LSH_K,
-    ALU_LSH_X,
-    ALU_RSH_K,
-    ALU_RSH_X,
-    ALU_XOR_K,
-    ALU_XOR_X,
-    ALU_NEG,
+    ALU_ADD_K, ALU_ADD_X, ALU_SUB_K, ALU_SUB_X, ALU_MUL_K, ALU_MUL_X, ALU_DIV_K, ALU_DIV_X,
+    ALU_OR_K, ALU_OR_X, ALU_AND_K, ALU_AND_X, ALU_LSH_K, ALU_LSH_X, ALU_RSH_K, ALU_RSH_X,
+    ALU_XOR_K, ALU_XOR_X, ALU_NEG,
     // Jumps. These are all forward-only, which the verifier enforces: that is
     // what makes the program terminate without needing to look for cycles.
-    JA,
-    JEQ_K,
-    JEQ_X,
-    JGT_K,
-    JGT_X,
-    JGE_K,
-    JGE_X,
-    JSET_K,
-    JSET_X,
+    JA, JEQ_K, JEQ_X, JGT_K, JGT_X, JGE_K, JGE_X, JSET_K, JSET_X,
     // Verdicts. The last instruction of a program must be one of these.
-    RET_K,
-    RET_A,
+    RET_K, RET_A,
 ];
 
 /// One classic BPF instruction.

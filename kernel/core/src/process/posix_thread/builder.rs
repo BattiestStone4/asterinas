@@ -13,7 +13,6 @@ use ostd::{
 use spin::Once;
 
 use super::{PosixThread, ThreadLocal};
-use crate::seccomp::SeccompState;
 use crate::{
     fs::{file::file_table::FileTable, thread_info::ThreadFsInfo},
     prelude::*,
@@ -23,6 +22,7 @@ use crate::{
         signal::{sig_mask::AtomicSigMask, sig_queues::SigQueues},
     },
     sched::{Nice, SchedPolicy},
+    seccomp::SeccompState,
     thread::{Thread, Tid, task},
     time::{TimerManager, clocks::ProfClock},
     vm::vmar::VmarHandle,

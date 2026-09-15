@@ -20,12 +20,11 @@ mod bpf;
 mod interpreter;
 mod verifier;
 
-use interpreter::Program;
-
 // The parts of a filter that the system call layer has to name: the description
 // it reads out of user memory, the instructions it is made of, the length they
 // may not exceed, and the check they have to pass before the filter may run.
 pub(crate) use bpf::{BPF_MAXINSNS, SockFilter, SockFprog};
+use interpreter::Program;
 pub(crate) use verifier::verify;
 
 /// The verdicts a filter may reach, as the seccomp ABI encodes them.
@@ -528,7 +527,9 @@ mod test {
         assert_eq!(state.run_filters(&data(0)), SECCOMP_RET_ERRNO | 1);
 
         let state = filtered(verdict(SECCOMP_RET_ERRNO | 1));
-        state.attach_filter(verdict(SECCOMP_RET_ERRNO | 13)).unwrap();
+        state
+            .attach_filter(verdict(SECCOMP_RET_ERRNO | 13))
+            .unwrap();
         assert_eq!(state.run_filters(&data(0)), SECCOMP_RET_ERRNO | 13);
     }
 
@@ -539,7 +540,9 @@ mod test {
         // that says anything. `KILL_THREAD` is installed last so that nothing
         // but a full walk can find it.
         let state = filtered(verdict(SECCOMP_RET_ALLOW));
-        state.attach_filter(verdict(SECCOMP_RET_ERRNO | 13)).unwrap();
+        state
+            .attach_filter(verdict(SECCOMP_RET_ERRNO | 13))
+            .unwrap();
         state
             .attach_filter(verdict(SECCOMP_RET_KILL_THREAD))
             .unwrap();
@@ -570,7 +573,10 @@ mod test {
         assert!(state.set_mode(SeccompMode::Strict).is_ok());
 
         assert_eq!(
-            state.attach_filter(verdict(SECCOMP_RET_ALLOW)).unwrap_err().error(),
+            state
+                .attach_filter(verdict(SECCOMP_RET_ALLOW))
+                .unwrap_err()
+                .error(),
             Errno::EINVAL
         );
         // The filter must not have been left behind in the chain either: the

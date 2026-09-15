@@ -13,7 +13,7 @@
 //! and <https://elixir.bootlin.com/linux/v6.16.5/source/net/core/filter.c>.
 
 use super::{
-    SECCOMP_DATA_SIZE, SeccompData,
+    SECCOMP_DATA_SIZE, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD, SeccompData,
     bpf::{
         ALU_ADD_K, ALU_ADD_X, ALU_AND_K, ALU_AND_X, ALU_DIV_K, ALU_DIV_X, ALU_LSH_K, ALU_LSH_X,
         ALU_MUL_K, ALU_MUL_X, ALU_NEG, ALU_OR_K, ALU_OR_X, ALU_RSH_K, ALU_RSH_X, ALU_SUB_K,
@@ -21,7 +21,6 @@ use super::{
         JGT_X, JSET_K, JSET_X, LD_IMM, LD_MEM, LD_W_ABS, LD_W_LEN, LDX_IMM, LDX_MEM, LDX_W_LEN,
         RET_A, RET_K, ST, STX, SockFilter, TAX, TXA,
     },
-    SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD,
 };
 use crate::prelude::*;
 
