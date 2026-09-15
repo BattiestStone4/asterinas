@@ -23,5 +23,6 @@ set -e
 ./namespace/setns
 ./namespace/unshare
 
+./seccomp/filter
 ./seccomp/prctl
 ./seccomp/strict
