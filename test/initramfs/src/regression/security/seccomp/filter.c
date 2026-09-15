@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <linux/capability.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/prctl.h>
@@ -126,6 +127,61 @@ static int allow_confining_this_thread(void)
 	return prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 }
 
+/*
+ * `CAP_SYS_ADMIN` is the other thing that permits installing a filter without
+ * `no_new_privs`: it is the privilege to decide the confinement of other
+ * processes, so a thread that holds it does not need the promise.
+ *
+ * Whether a thread holds it is not something these tests may assume. A container
+ * runtime hands out a capability set of its own choosing -- Docker's leaves this
+ * one out -- while a bare-metal root and the Asterinas root both have it, so the
+ * answer depends on where the tests are run rather than on what is being tested.
+ * A test that wants to see the refusal therefore has to put its thread into the
+ * state that is refused, and one that wants to see the permission has to ask
+ * whether the thread is in the state that is permitted.
+ */
+
+/* Whether `CAP_SYS_ADMIN` is in the calling thread's effective set. */
+static int has_cap_sys_admin(void)
+{
+	struct __user_cap_header_struct header = {
+		.version = _LINUX_CAPABILITY_VERSION_3,
+		.pid = 0,
+	};
+	struct __user_cap_data_struct data[2] = { 0 };
+
+	if (syscall(SYS_capget, &header, data) != 0) {
+		return 0;
+	}
+
+	return (data[0].effective & (1U << CAP_SYS_ADMIN)) != 0;
+}
+
+/*
+ * Takes `CAP_SYS_ADMIN` out of the calling thread's effective and permitted
+ * sets.
+ *
+ * Losing a capability is always allowed; it is gaining one that is checked, and
+ * dropping this one only narrows what the thread may do.
+ */
+static int drop_cap_sys_admin(void)
+{
+	struct __user_cap_header_struct header = {
+		.version = _LINUX_CAPABILITY_VERSION_3,
+		.pid = 0,
+	};
+	struct __user_cap_data_struct data[2] = { 0 };
+
+	if (syscall(SYS_capget, &header, data) != 0) {
+		return -1;
+	}
+
+	data[0].effective &= ~(1U << CAP_SYS_ADMIN);
+	data[0].permitted &= ~(1U << CAP_SYS_ADMIN);
+
+	return syscall(SYS_capset, &header, data);
+}
+
 /**
  * Whether a verdict asks for a kill, rather than for the system call to fail.
  *
@@ -180,15 +236,70 @@ FN_TEST(installing_a_filter_requires_no_new_privs)
 		/*
 		 * Without the promise that the thread will not gain privileges,
 		 * confining it is not something it is allowed to decide.
+		 *
+		 * The capability would permit it just as well, and this test is
+		 * about the promise, so it is dropped first: otherwise what is
+		 * being asked is whether the environment happens to hand it out.
+		 * Failing to drop it is reported as an unexpected outcome, since
+		 * the installation that follows might then be allowed.
 		 */
-		char report = 'F';
-		if (install_filter(program, 1, 0) != 0 && errno == EACCES) {
+		char report = drop_cap_sys_admin() == 0 ? 'F' : 'A';
+		if (report == 'F' && install_filter(program, 1, 0) != 0 &&
+		    errno == EACCES) {
 			report = allow_confining_this_thread() == 0 &&
 						 install_filter(program, 1,
 								0) == 0 ?
 					 'S' :
 					 'A';
 		}
+
+		if (write(ready_pipe[1], &report, 1) != 1) {
+			syscall(SYS_exit, EXIT_FAILURE);
+		}
+
+		/* The filter allows everything, so `exit(3)` is allowed too. */
+		exit(EXIT_SUCCESS);
+	}
+
+	close(ready_pipe[1]);
+
+	char report = '\0';
+	TEST_RES(read(ready_pipe[0], &report, 1), _ret == 1 && report == 'S');
+
+	int status = 0;
+	TEST_SUCC(waitpid(child, &status, 0));
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	CHECK(close(ready_pipe[0]));
+}
+END_TEST()
+
+FN_TEST(cap_sys_admin_may_install_a_filter_without_no_new_privs)
+{
+	SKIP_IF_CONFINED();
+
+	/*
+	 * A capability cannot be granted by a test to itself, so where the thread
+	 * does not hold this one there is nothing to ask about. The test says so
+	 * rather than asserting an outcome that the environment, not the kernel,
+	 * would be deciding.
+	 */
+	SKIP_TEST_IF(!has_cap_sys_admin());
+
+	int ready_pipe[2];
+	TEST_SUCC(pipe(ready_pipe));
+
+	pid_t child = TEST_SUCC(fork());
+	if (child == 0) {
+		close(ready_pipe[0]);
+
+		struct sock_filter program[1];
+		build_allow_all(program);
+
+		/*
+		 * The thread holds the capability and has promised nothing, which
+		 * is the other way of being allowed to confine it.
+		 */
+		char report = install_filter(program, 1, 0) == 0 ? 'S' : 'F';
 
 		if (write(ready_pipe[1], &report, 1) != 1) {
 			syscall(SYS_exit, EXIT_FAILURE);
