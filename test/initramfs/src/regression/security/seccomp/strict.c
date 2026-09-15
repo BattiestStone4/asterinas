@@ -133,3 +133,76 @@ FN_TEST(forbidden_syscall_kills_the_thread)
 	CHECK(close(ready_pipe[0]));
 }
 END_TEST()
+
+/*
+ * The allowlist holds `_exit(2)` but not `exit_group(2)`, even though the two
+ * calls look interchangeable. They are not: `exit(3)` issues `exit_group(2)`,
+ * so a confined thread that ends with `exit(3)` is terminated rather than
+ * exiting. Pin the contrast down in one place, since removing `_exit(2)` from
+ * the allowlist and adding `exit_group(2)` to it are both plausible mistakes.
+ */
+FN_TEST(exit_is_allowed_but_exit_group_is_not)
+{
+	SKIP_IF_CONFINED();
+
+	int ready_pipe[2];
+	TEST_SUCC(pipe(ready_pipe));
+
+	/* `_exit(2)` lets the confined thread terminate normally. */
+	pid_t child = TEST_SUCC(fork());
+	if (child == 0) {
+		close(ready_pipe[0]);
+
+		long ret =
+			syscall(SYS_seccomp, SECCOMP_SET_MODE_STRICT, 0, NULL);
+		char report = (ret == 0) ? 'S' : 'F';
+		if (write(ready_pipe[1], &report, 1) != 1) {
+			syscall(SYS_exit, EXIT_FAILURE);
+		}
+
+		syscall(SYS_exit, EXIT_SUCCESS);
+	}
+
+	close(ready_pipe[1]);
+
+	char report = '\0';
+	TEST_RES(read(ready_pipe[0], &report, 1), _ret == 1 && report == 'S');
+
+	int status = 0;
+	TEST_SUCC(waitpid(child, &status, 0));
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	/* `exit_group(2)` terminates the thread instead, without the call ever
+	 * being dispatched. */
+	int group_pipe[2];
+	TEST_SUCC(pipe(group_pipe));
+
+	child = TEST_SUCC(fork());
+	if (child == 0) {
+		close(group_pipe[0]);
+
+		long ret =
+			syscall(SYS_seccomp, SECCOMP_SET_MODE_STRICT, 0, NULL);
+		char report = (ret == 0) ? 'S' : 'F';
+		if (write(group_pipe[1], &report, 1) != 1) {
+			syscall(SYS_exit, EXIT_FAILURE);
+		}
+
+		/* The kernel must terminate the thread right here. */
+		(void)syscall(SYS_exit_group, EXIT_SUCCESS);
+		syscall(SYS_exit, EXIT_FAILURE);
+	}
+
+	close(group_pipe[1]);
+
+	report = '\0';
+	TEST_RES(read(group_pipe[0], &report, 1), _ret == 1 && report == 'S');
+
+	status = 0;
+	TEST_SUCC(waitpid(child, &status, 0));
+	TEST_RES(status, WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+
+	CHECK(close(group_pipe[0]));
+	CHECK(close(ready_pipe[0]));
+}
+END_TEST()
