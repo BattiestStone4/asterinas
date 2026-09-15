@@ -22,15 +22,6 @@
  * for the reasons explained there.
  */
 
-/* The seccomp modes that `PR_SET_SECCOMP` accepts. They are defined by
- * `<linux/seccomp.h>`, which is not available in every build environment. */
-#ifndef SECCOMP_MODE_STRICT
-#define SECCOMP_MODE_STRICT 1
-#endif
-#ifndef SECCOMP_MODE_FILTER
-#define SECCOMP_MODE_FILTER 2
-#endif
-
 FN_TEST(disabled_mode_is_reported_by_prctl)
 {
 	SKIP_IF_CONFINED();

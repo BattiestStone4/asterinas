@@ -84,6 +84,32 @@ static void build_refuse_lseek_fd(struct sock_filter *program,
 	memcpy(program, body, sizeof(body));
 }
 
+/**
+ * Fills `program` with a filter that refuses `getpid(2)` with `EPERM`, but only
+ * for a system call the kernel reports as coming from `required_arch`. A call
+ * from anywhere else is killed instead.
+ *
+ * This is the shape of the prologue that every filter libseccomp generates opens
+ * with. The architecture is checked before the rules that follow it, because on
+ * another architecture the same system call number names a different call, and
+ * those rules would then mean something the filter's author never intended.
+ */
+static void build_refuse_getpid_from_arch(struct sock_filter *program,
+					  unsigned int required_arch)
+{
+	struct sock_filter body[] = {
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, required_arch, 0, 4),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getpid, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+	};
+
+	memcpy(program, body, sizeof(body));
+}
+
 /* A program that allows every system call. */
 static void build_allow_all(struct sock_filter *program)
 {
@@ -330,6 +356,173 @@ FN_TEST(the_filter_sees_the_arguments_of_the_syscall)
 			 */
 			if (refused_errno == EPERM && unknown_errno == EBADF) {
 				report = 'S';
+			}
+		}
+
+		if (write(ready_pipe[1], &report, 1) != 1) {
+			syscall(SYS_exit, EXIT_FAILURE);
+		}
+		exit(EXIT_SUCCESS);
+	}
+
+	close(ready_pipe[1]);
+
+	char report = '\0';
+	TEST_RES(read(ready_pipe[0], &report, 1), _ret == 1 && report == 'S');
+
+	int status = 0;
+	TEST_SUCC(waitpid(child, &status, 0));
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	CHECK(close(ready_pipe[0]));
+}
+END_TEST()
+
+/*
+ * The architecture the kernel reports to a filter is part of the contract. A
+ * filter's rules only mean what their author intended on one architecture, so
+ * the prologue that every filter libseccomp generates opens with is a check of
+ * this value, and the rules below it are trusted only if the check passes.
+ *
+ * Neither half of this can read the reported value directly — a filter can act
+ * on what it sees but cannot tell anyone what it saw — so the check is done by
+ * making one program act differently on the two possibilities. It refuses
+ * `getpid(2)` with `EPERM` when the call is reported as coming from
+ * `AUDIT_ARCH_NATIVE`, and kills the process when it is reported as coming from
+ * anywhere else. The two tests below run that same program and differ only in
+ * the architecture it names.
+ */
+FN_TEST(a_filter_can_demand_the_architecture_it_was_written_for)
+{
+	SKIP_IF_CONFINED();
+
+	int ready_pipe[2];
+	TEST_SUCC(pipe(ready_pipe));
+
+	pid_t child = TEST_SUCC(fork());
+	if (child == 0) {
+		close(ready_pipe[0]);
+
+		struct sock_filter program[7];
+		build_refuse_getpid_from_arch(program, AUDIT_ARCH_NATIVE);
+
+		char report = 'F';
+		if (allow_confining_this_thread() == 0 &&
+		    install_filter(program, 7, 0) == 0) {
+			/*
+			 * The filter named the machine this test was
+			 * compiled for, so the kernel's answer and the
+			 * filter's expectation agree and the refusal below
+			 * is reached rather than the kill.
+			 */
+			errno = 0;
+			long refused = syscall(SYS_getpid);
+
+			if (refused == -1 && errno == EPERM) {
+				report = 'S';
+			} else if (refused != -1) {
+				report = 'N';
+			}
+		}
+
+		if (write(ready_pipe[1], &report, 1) != 1) {
+			syscall(SYS_exit, EXIT_FAILURE);
+		}
+		exit(EXIT_SUCCESS);
+	}
+
+	close(ready_pipe[1]);
+
+	char report = '\0';
+	TEST_RES(read(ready_pipe[0], &report, 1), _ret == 1 && report == 'S');
+
+	int status = 0;
+	TEST_SUCC(waitpid(child, &status, 0));
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	CHECK(close(ready_pipe[0]));
+}
+END_TEST()
+
+FN_TEST(a_filter_that_names_another_architecture_kills_the_call)
+{
+	SKIP_IF_CONFINED();
+
+	int ready_pipe[2];
+	TEST_SUCC(pipe(ready_pipe));
+
+	pid_t child = TEST_SUCC(fork());
+	if (child == 0) {
+		close(ready_pipe[0]);
+
+		/*
+		 * The same machine with the 64-bit flag cleared. No kernel
+		 * reports this value, so a filter that demands it matches
+		 * nothing and kills every system call it is given — which is
+		 * what a real filter's prologue does when it is handed a system
+		 * call number it cannot interpret.
+		 */
+		struct sock_filter program[7];
+		build_refuse_getpid_from_arch(program,
+					      AUDIT_ARCH_NATIVE & 0x7fffffffU);
+
+		if (allow_confining_this_thread() == 0 &&
+		    install_filter(program, 7, 0) == 0) {
+			/* The next system call the thread makes is the kill. */
+			(void)syscall(SYS_getpid);
+		}
+
+		/* Only reached if the filter never took effect. */
+		char report = 'N';
+		if (write(ready_pipe[1], &report, 1) != 1) {
+			syscall(SYS_exit, EXIT_FAILURE);
+		}
+		exit(EXIT_SUCCESS);
+	}
+
+	close(ready_pipe[1]);
+
+	/*
+	 * Nothing was written: the thread was killed on the system call
+	 * after the one that installed the filter, before it could report.
+	 */
+	char report = '\0';
+	TEST_RES(read(ready_pipe[0], &report, 1), _ret == 0);
+
+	int status = 0;
+	TEST_SUCC(waitpid(child, &status, 0));
+	TEST_RES(status, WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS);
+	CHECK(close(ready_pipe[0]));
+}
+END_TEST()
+
+/*
+ * `PR_SET_SECCOMP` is the older spelling of the same installation, from before
+ * the flags `seccomp(2)` takes. A filter installed through it has to be enforced
+ * exactly like one installed through the newer call.
+ */
+FN_TEST(prctl_can_install_a_filter)
+{
+	SKIP_IF_CONFINED();
+
+	int ready_pipe[2];
+	TEST_SUCC(pipe(ready_pipe));
+
+	pid_t child = TEST_SUCC(fork());
+	if (child == 0) {
+		close(ready_pipe[0]);
+
+		struct sock_filter program[4];
+		build_refuse_getpid(program, SECCOMP_RET_ERRNO | EPERM);
+
+		char report = 'F';
+		if (allow_confining_this_thread() == 0 &&
+		    install_filter_by_prctl(program, 4) == 0) {
+			errno = 0;
+			long refused = syscall(SYS_getpid);
+
+			if (refused == -1 && errno == EPERM) {
+				report = 'S';
+			} else if (refused != -1) {
+				report = 'N';
 			}
 		}
 

@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -26,6 +27,13 @@
 /* Asks whether an action is available. Its argument is a pointer to the action
  * to ask about. */
 #define SECCOMP_GET_ACTION_AVAIL 2
+
+/* What the second argument of `PR_SET_SECCOMP` selects. This is a different set
+ * of numbers from the operations above, because the older call predates their
+ * naming, and the two are easy to confuse: the strict mode is 0 as an operation
+ * and 1 as a mode. */
+#define SECCOMP_MODE_STRICT 1
+#define SECCOMP_MODE_FILTER 2
 
 /* Older versions of `<sys/syscall.h>` may not define this. */
 #ifndef SYS_seccomp
@@ -58,6 +66,29 @@
 #define SECCOMP_DATA_NR_OFFSET 0
 #define SECCOMP_DATA_ARCH_OFFSET 4
 #define SECCOMP_DATA_ARGS_OFFSET 16
+
+/* The value the `arch` field holds: the machine's `EM_*` number combined with
+ * the flags saying it is 64-bit and little-endian, which is one value per
+ * architecture.
+ *
+ * A filter has to check this before it trusts a system call number, since the
+ * same number names different calls on different architectures. Every filter
+ * libseccomp generates opens with that check for this reason. The values below
+ * are written out rather than computed, because the machine numbers are not
+ * available to a program that only includes the C library, and the `#else` is
+ * there so that a machine without an entry fails the build rather than quietly
+ * checking for the wrong one. */
+#if defined(__x86_64__)
+#define AUDIT_ARCH_NATIVE 0xc000003eU
+#elif defined(__aarch64__)
+#define AUDIT_ARCH_NATIVE 0xc00000b7U
+#elif defined(__riscv) && __riscv_xlen == 64
+#define AUDIT_ARCH_NATIVE 0xc00000f3U
+#elif defined(__loongarch__) && __loongarch_grlen == 64
+#define AUDIT_ARCH_NATIVE 0xc0000102U
+#else
+#error "no seccomp architecture for this machine"
+#endif
 
 /* One classic-BPF instruction, and a program as userspace describes it. */
 struct sock_filter {
@@ -105,6 +136,24 @@ static inline long install_filter(struct sock_filter *program,
 	struct sock_fprog fprog = { .len = len, .filter = program };
 
 	return syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, flags, &fprog);
+}
+
+/**
+ * Installs `program` as a filter on the calling thread through
+ * `PR_SET_SECCOMP`, the older spelling, which takes no flags.
+ *
+ * Note what this call is given: a pointer to a `struct sock_fprog`, exactly as
+ * `seccomp(2)` is. The two spellings differ in the flags they accept, not in
+ * what they describe the program with. Handing this one the program itself
+ * instead is refused with `EFAULT`, because the kernel reads a structure of its
+ * own shape out of the pointer it is given.
+ */
+static inline long install_filter_by_prctl(struct sock_filter *program,
+					   unsigned short len)
+{
+	struct sock_fprog fprog = { .len = len, .filter = program };
+
+	return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog);
 }
 
 /**
