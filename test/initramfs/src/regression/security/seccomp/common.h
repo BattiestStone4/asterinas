@@ -53,9 +53,14 @@
  * names the action and the low half carries data for it. */
 #define SECCOMP_RET_KILL_PROCESS 0x80000000U
 #define SECCOMP_RET_KILL_THREAD 0x00000000U
+#define SECCOMP_RET_TRAP 0x00030000U
 #define SECCOMP_RET_ERRNO 0x00050000U
 #define SECCOMP_RET_ALLOW 0x7fff0000U
 #define SECCOMP_RET_DATA 0x0000ffffU
+
+/* The `si_code` of the `SIGSYS` that a `SECCOMP_RET_TRAP` verdict raises, for
+ * which the data half of the verdict is reported as `si_errno`. */
+#define SYS_SECCOMP 1
 
 /* The largest program a filter may be, in instructions. */
 #define BPF_MAXINSNS 4096
@@ -154,6 +159,18 @@ static inline long install_filter_by_prctl(struct sock_filter *program,
 	struct sock_fprog fprog = { .len = len, .filter = program };
 
 	return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog);
+}
+
+/**
+ * Makes the promise that the calling thread will not gain any privileges,
+ * without which a filter may not be installed.
+ *
+ * The promise is a property of a thread, so a thread that wants to install one
+ * has to make it itself, even if another thread already has.
+ */
+static inline int allow_confining_this_thread(void)
+{
+	return prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 }
 
 /**

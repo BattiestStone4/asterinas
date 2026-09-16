@@ -121,12 +121,6 @@ static void build_allow_all(struct sock_filter *program)
 	memcpy(program, body, sizeof(body));
 }
 
-/* Sets `no_new_privs`, without which a filter may not be installed. */
-static int allow_confining_this_thread(void)
-{
-	return prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-}
-
 /*
  * `CAP_SYS_ADMIN` is the other thing that permits installing a filter without
  * `no_new_privs`: it is the privilege to decide the confinement of other
@@ -1191,9 +1185,8 @@ FN_TEST(the_core_actions_are_reported_as_available)
 	SKIP_IF_CONFINED();
 
 	unsigned int available[] = {
-		SECCOMP_RET_KILL_PROCESS,
-		SECCOMP_RET_KILL_THREAD,
-		SECCOMP_RET_ERRNO,
+		SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD,
+		SECCOMP_RET_TRAP,	  SECCOMP_RET_ERRNO,
 		SECCOMP_RET_ALLOW,
 	};
 

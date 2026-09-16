@@ -26,3 +26,4 @@ set -e
 ./seccomp/filter
 ./seccomp/prctl
 ./seccomp/strict
+./seccomp/trap
