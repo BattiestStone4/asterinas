@@ -30,7 +30,6 @@ Unsupported operations:
 * `PR_MPX_ENABLE_MANAGEMENT` and `PR_MPX_DISABLE_MANAGEMENT`
 * `PR_PAC_RESET_KEYS`
 * `PR_SET_PTRACER`
-* `PR_GET_SECCOMP` and `PR_SET_SECCOMP`
 * `PR_GET_SPECULATION_CTRL` and `PR_SET_SPECULATION_CTRL`
 * `PR_SVE_GET_VL` and `PR_SVE_SET_VL`
 * `PR_SET_SYSCALL_USER_DISPATCH`
@@ -99,3 +98,35 @@ Unsupported flags:
 
 For more information,
 see [the man page](https://man7.org/linux/man-pages/man2/setns.2.html).
+
+### `seccomp`
+
+Supported functionality in SCML:
+
+```c
+{{#include seccomp.scml}}
+```
+
+Unsupported operations:
+* `SECCOMP_GET_NOTIF_SIZES`, because the user-notification action whose
+  structures it describes is not supported
+
+Unsupported filter flags:
+* `SECCOMP_FILTER_FLAG_TSYNC`, `SECCOMP_FILTER_FLAG_LOG` and
+  `SECCOMP_FILTER_FLAG_SPEC_ALLOW`
+
+  Rather than being ignored, every flag is refused with `EINVAL`, so that a
+  caller is never left believing that a filter does more than it does. The
+  first of the three is the one that matters: it is what a sandbox runtime
+  passes when it sets up a container, and without it a filter confines only the
+  thread that installs it.
+
+Unsupported actions:
+* `SECCOMP_RET_LOG`, `SECCOMP_RET_TRACE` and `SECCOMP_RET_USER_NOTIF`
+
+  A verdict naming one of these terminates the process rather than being taken
+  for permission. `SECCOMP_GET_ACTION_AVAIL` reports only the actions that are
+  implemented.
+
+For more information,
+see [the man page](https://man7.org/linux/man-pages/man2/seccomp.2.html).

@@ -30,5 +30,8 @@ prctl(op = PR_GET_CHILD_SUBREAPER | PR_SET_CHILD_SUBREAPER, isset);
 // Retrieve or set the no-new-privileges attribute
 prctl(op = PR_GET_NO_NEW_PRIVS | PR_SET_NO_NEW_PRIVS);
 
+// Retrieve or set the secure computing mode, which `seccomp(2)` also sets
+prctl(op = PR_GET_SECCOMP | PR_SET_SECCOMP, mode);
+
 // Retrieve or set the timer slack value (nanoseconds)
 prctl(op = PR_GET_TIMERSLACK | PR_SET_TIMERSLACK, slack_ns);

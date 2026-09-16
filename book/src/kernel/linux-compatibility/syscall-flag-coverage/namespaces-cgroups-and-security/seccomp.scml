@@ -1,0 +1,9 @@
+// Move the calling thread into the strict mode, in which only `read(2)`,
+// `write(2)`, `_exit(2)` and `sigreturn(2)` are allowed
+seccomp(operation = SECCOMP_SET_MODE_STRICT);
+
+// Restrict the calling thread to what a classic-BPF program allows
+seccomp(operation = SECCOMP_SET_MODE_FILTER);
+
+// Ask whether a seccomp action is available
+seccomp(operation = SECCOMP_GET_ACTION_AVAIL);
