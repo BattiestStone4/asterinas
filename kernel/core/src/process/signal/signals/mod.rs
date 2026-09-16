@@ -3,6 +3,7 @@
 pub(crate) mod fault;
 pub(crate) mod kernel;
 pub(crate) mod raw;
+pub(crate) mod sigsys;
 pub(crate) mod user;
 
 use core::{any::Any, fmt::Debug};

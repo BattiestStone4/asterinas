@@ -22,7 +22,12 @@ use crate::{
     process::{
         TermStatus,
         posix_thread::{do_exit, do_exit_group},
-        signal::constants::{SIGKILL, SIGSYS},
+        signal::{
+            constants::{SIGKILL, SIGSYS},
+            get_sig_action,
+            sig_action::SigAction,
+            signals::sigsys::SigsysSignal,
+        },
     },
     seccomp::{SeccompAction, SeccompData, SeccompMode},
 };
@@ -424,10 +429,10 @@ pub(crate) fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
 /// is making, and returns whether the system call may go ahead.
 ///
 /// By the time this returns `false`, the restriction has already been carried
-/// out: an `errno` has been placed in the system call's return value, and a
-/// kill has terminated either the thread or its whole process. Both of the
-/// kills, like [`do_exit`], return, so the caller must not dispatch the system
-/// call afterwards — which is exactly what the return value says.
+/// out: an `errno` has been placed in the system call's return value, a `SIGSYS`
+/// has been raised, or a kill has terminated either the thread or its whole
+/// process. The kills, like [`do_exit`], return, so the caller must not dispatch
+/// the system call afterwards — which is exactly what the return value says.
 fn seccomp_allows(
     ctx: &Context,
     user_ctx: &mut UserContext,
@@ -455,13 +460,17 @@ fn seccomp_allows(
         }
 
         SeccompMode::Filter => {
+            // The address the system call would return to. A filter is shown it
+            // and a trap reports it, so it is read once and used for both.
+            let instruction_pointer = user_ctx.instruction_pointer() as u64;
+
             // This is everything a filter is allowed to see of the system call,
             // which is what keeps one from reaching into the kernel: it is given
             // numbers, never objects.
             let data = SeccompData {
                 nr: syscall_frame.syscall_number as i32,
                 arch: AUDIT_ARCH,
-                instruction_pointer: user_ctx.instruction_pointer() as u64,
+                instruction_pointer,
                 args: syscall_frame.args,
             };
 
@@ -483,6 +492,58 @@ fn seccomp_allows(
                     false
                 }
 
+                SeccompAction::Trap(data) => {
+                    debug!(
+                        "seccomp: the filter traps the syscall {}",
+                        syscall_frame.syscall_number
+                    );
+
+                    // Note what is *not* done here: the return value is left
+                    // alone. A trapped system call is not one that failed, it is
+                    // one that is never made, so the caller sees whichever value
+                    // its return register already held. Leaving the register be
+                    // is what produces that, and it is also what lets the signal
+                    // handler choose the value instead, by writing it into the
+                    // context it is handed.
+                    //
+                    // Leaving it be has one consequence that is worth naming,
+                    // because it looks like a mistake. On the machines whose
+                    // return register is also the one that carried the first
+                    // argument (aarch64, riscv64 and loongarch64), a trapped call
+                    // that was passed `-ERESTARTSYS` leaves exactly the value the
+                    // restart logic looks for in the place where it looks, and a
+                    // handler with `SA_RESTART` therefore watches the call be
+                    // made again. Linux answers the same way for the same reason,
+                    // as measured on aarch64: the register is not written there
+                    // either, so neither machine can tell this call from one that
+                    // was interrupted. x86-64 is out of reach of the question
+                    // altogether, since its return register holds the system call
+                    // number for as long as the trap is being raised.
+                    let signal = SigsysSignal::new(
+                        data,
+                        syscall_frame.syscall_number as i32,
+                        AUDIT_ARCH,
+                        instruction_pointer as Vaddr,
+                    );
+
+                    // Raising the signal is only worth doing if it can reach a
+                    // handler. One that the thread has blocked cannot, and one
+                    // that is ignored is not wanted; Linux kills the process in
+                    // both cases rather than let the call through or let the
+                    // signal sit pending forever. A `SIGSYS` left at its default
+                    // needs nothing special, since its default action is to
+                    // terminate and the delivery below will do that.
+                    let reaches_a_handler = !ctx.posix_thread.sig_mask().contains(SIGSYS)
+                        && !matches!(get_sig_action(ctx, SIGSYS), SigAction::Ign);
+
+                    if reaches_a_handler {
+                        ctx.posix_thread.enqueue_signal(Box::new(signal));
+                    } else {
+                        do_exit_group(TermStatus::Killed(SIGSYS), ctx, user_ctx);
+                    }
+                    false
+                }
+
                 SeccompAction::KillThread => {
                     debug!(
                         "seccomp: the filter kills the thread over the syscall {}",
@@ -491,10 +552,9 @@ fn seccomp_allows(
 
                     // Note the signal: a filter kills with `SIGSYS`, where the
                     // strict mode above kills with `SIGKILL`. Linux makes the
-                    // same distinction. Neither signal is catchable, whichever
-                    // verdict asked for the kill; a filter that wants a
-                    // catchable `SIGSYS` has to ask for `SECCOMP_RET_TRAP`,
-                    // which is a later stage of the work.
+                    // same distinction. Neither kill is catchable, whichever
+                    // verdict asked for it; a filter that wants a `SIGSYS` a
+                    // handler can take has to ask for `SECCOMP_RET_TRAP`.
                     do_exit(TermStatus::Killed(SIGSYS), ctx, user_ctx);
                     false
                 }

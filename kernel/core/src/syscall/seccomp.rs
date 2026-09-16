@@ -7,7 +7,7 @@ use crate::{
     prelude::*,
     seccomp::{
         BPF_MAXINSNS, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS,
-        SECCOMP_RET_KILL_THREAD, SeccompMode, SockFilter, SockFprog, verify,
+        SECCOMP_RET_KILL_THREAD, SECCOMP_RET_TRAP, SeccompMode, SockFilter, SockFprog, verify,
     },
 };
 
@@ -43,9 +43,10 @@ const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1 << 0;
 /// Linux answers for a longer list, which includes the actions the later stages
 /// of the seccomp work will add; reporting one of those as available now would
 /// be a lie to the program that asked.
-const AVAILABLE_ACTIONS: [u32; 4] = [
+const AVAILABLE_ACTIONS: [u32; 5] = [
     SECCOMP_RET_KILL_PROCESS,
     SECCOMP_RET_KILL_THREAD,
+    SECCOMP_RET_TRAP,
     SECCOMP_RET_ERRNO,
     SECCOMP_RET_ALLOW,
 ];

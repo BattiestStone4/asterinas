@@ -80,6 +80,23 @@ impl siginfo_t {
     pub(crate) fn si_addr(&self) -> Vaddr {
         self.siginfo_fields.sigfault().addr
     }
+
+    pub(crate) fn set_si_errno(&mut self, si_errno: i32) {
+        self.si_errno = si_errno;
+    }
+
+    /// Fills in what the `SIGSYS` of a trapped system call reports.
+    ///
+    /// `call_addr` is where the system call was made from, `syscall` is its
+    /// number, and `arch` is the architecture it was made on, as one of the
+    /// `AUDIT_ARCH_*` values.
+    pub(crate) fn set_sigsys(&mut self, call_addr: Vaddr, syscall: i32, arch: u32) {
+        *self.siginfo_fields.sigsys_mut() = siginfo_sigsys_t {
+            call_addr,
+            syscall,
+            arch,
+        };
+    }
 }
 
 #[pod_union]
@@ -89,6 +106,7 @@ union siginfo_fields_t {
     bytes: [u8; 128 - size_of::<i32>() * 4],
     common: siginfo_common_t,
     sigfault: siginfo_sigfault_t,
+    sigsys: siginfo_sigsys_t,
 }
 
 impl Default for siginfo_fields_t {
@@ -174,6 +192,23 @@ struct siginfo_sigfault_t {
     addr: Vaddr, //*const c_void
     addr_lsb: i16,
     first: siginfo_sigfault_first_t,
+}
+
+/// What a `SIGSYS` reports when a filter trapped the system call.
+///
+/// Note which address this is: the one the system call would have returned to,
+/// not the one it was made from. Linux reports the former, although the
+/// `seccomp(2)` manual page describes it as "the address of the system call
+/// instruction". Measured on Linux 6.8 for aarch64, where a `svc` at `0x400b34`
+/// is reported as `0x400b38`.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/include/uapi/asm-generic/siginfo.h>.
+#[repr(C)]
+#[derive(Clone, Copy, Pod)]
+struct siginfo_sigsys_t {
+    call_addr: Vaddr,
+    syscall: i32,
+    arch: u32,
 }
 
 #[pod_union]

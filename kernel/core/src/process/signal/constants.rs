@@ -70,6 +70,13 @@ pub(crate) const SI_QUEUE: i32 = -1;
 pub(crate) const SI_USER: i32 = 0;
 pub(crate) const SI_KERNEL: i32 = 128;
 
+/// The `si_code` of the `SIGSYS` that `SECCOMP_RET_TRAP` raises.
+///
+/// It is the only positive `si_code` of the list, since a value above zero means
+/// the signal came from the kernel and this one names a specific kernel facility
+/// rather than a general one. `SYS_SECCOMP` is not a `SI_*` name in the headers.
+pub(crate) const SYS_SECCOMP: i32 = 1;
+
 pub(crate) const FPE_INTDIV: i32 = 1;
 pub(crate) const FPE_INTOVF: i32 = 2;
 pub(crate) const FPE_FLTDIV: i32 = 3;

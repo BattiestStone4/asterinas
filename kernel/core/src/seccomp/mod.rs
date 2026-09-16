@@ -35,6 +35,7 @@ pub(crate) use verifier::verify;
 /// safest reading of a verdict nobody recognises.
 pub(crate) const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 pub(crate) const SECCOMP_RET_KILL_THREAD: u32 = 0x0000_0000;
+pub(crate) const SECCOMP_RET_TRAP: u32 = 0x0003_0000;
 pub(crate) const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 pub(crate) const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 
@@ -67,6 +68,9 @@ pub(crate) enum SeccompAction {
     Allow,
     /// Fail the system call with this error number.
     Errno(u16),
+    /// Do not make the system call, and raise a `SIGSYS` instead. The data is
+    /// the verdict's, and is reported to the handler as `si_errno`.
+    Trap(u16),
     /// Terminate the thread that made the system call.
     KillThread,
     /// Terminate every thread in the process that made the system call.
@@ -86,8 +90,10 @@ impl SeccompAction {
             SECCOMP_RET_ALLOW => Self::Allow,
             // The error number is capped here rather than where it is used, so
             // that an `Errno` always carries the number the system call will
-            // fail with.
+            // fail with. The data of a trap is not an error number, so it is
+            // passed through as it is.
             SECCOMP_RET_ERRNO => Self::Errno(((verdict & SECCOMP_RET_DATA) as u16).min(MAX_ERRNO)),
+            SECCOMP_RET_TRAP => Self::Trap((verdict & SECCOMP_RET_DATA) as u16),
             SECCOMP_RET_KILL_THREAD => Self::KillThread,
             _ => Self::KillProcess,
         }
@@ -623,6 +629,10 @@ mod test {
             SeccompAction::Errno(13)
         );
         assert_eq!(
+            SeccompAction::from_verdict(SECCOMP_RET_TRAP),
+            SeccompAction::Trap(0)
+        );
+        assert_eq!(
             SeccompAction::from_verdict(SECCOMP_RET_KILL_THREAD),
             SeccompAction::KillThread
         );
@@ -653,12 +663,26 @@ mod test {
     }
 
     #[ktest]
+    fn the_data_of_a_trap_reaches_the_handler_whole() {
+        // Unlike an error number, the data of a trap is not capped: it is
+        // reported to the signal handler as it is, so the filter can put
+        // whatever it likes there.
+        assert_eq!(
+            SeccompAction::from_verdict(SECCOMP_RET_TRAP | 0x1234),
+            SeccompAction::Trap(0x1234)
+        );
+        assert_eq!(
+            SeccompAction::from_verdict(SECCOMP_RET_TRAP | 0xffff),
+            SeccompAction::Trap(0xffff)
+        );
+    }
+
+    #[ktest]
     fn a_verdict_naming_an_action_that_is_not_implemented_kills_the_process() {
-        // Traffic control, user notification and logging are all real seccomp
-        // actions, and none of them is implemented here. A verdict asking for
-        // one of them must not be mistaken for permission.
+        // User notification, tracing and logging are all real seccomp actions,
+        // and none of them is implemented here. A verdict asking for one of them
+        // must not be mistaken for permission.
         let unimplemented = [
-            0x0003_0000, // SECCOMP_RET_TRAP
             0x7fc0_0000, // SECCOMP_RET_USER_NOTIF
             0x7ff0_0000, // SECCOMP_RET_TRACE
             0x7ffc_0000, // SECCOMP_RET_LOG

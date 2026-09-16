@@ -274,7 +274,7 @@ fn requeue_signal(ctx: &Context, signal: DequeuedSignal) {
     }
 }
 
-fn get_sig_action(ctx: &Context, sig_num: SigNum) -> SigAction {
+pub(crate) fn get_sig_action(ctx: &Context, sig_num: SigNum) -> SigAction {
     let sig_dispositions = ctx.process.sig_dispositions().lock();
     let sig_dispositions = sig_dispositions.lock();
     sig_dispositions.get(sig_num)
