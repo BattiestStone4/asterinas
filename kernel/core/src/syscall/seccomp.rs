@@ -5,10 +5,12 @@ use ostd::mm::VmIo;
 use super::SyscallReturn;
 use crate::{
     prelude::*,
+    process::posix_thread::AsPosixThread,
     seccomp::{
-        BPF_MAXINSNS, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS,
+        BPF_MAXINSNS, Program, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS,
         SECCOMP_RET_KILL_THREAD, SECCOMP_RET_TRAP, SeccompMode, SockFilter, SockFprog, verify,
     },
+    thread::AsThread,
 };
 
 /// Restricts the thread to `read(2)`, `write(2)`, `_exit(2)` and `sigreturn(2)`.
@@ -20,22 +22,53 @@ const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
 /// Queries the sizes of the seccomp notification structures.
 const SECCOMP_GET_NOTIF_SIZES: u32 = 3;
 
-/// The filter flags whose behaviour is implemented, which is none of them.
+/// The filter flags that installation accepts.
 ///
-/// A flag that a caller passes and that installation ignores would leave it
-/// believing the filter does more than it does, so every flag is refused
-/// instead. [`SECCOMP_FILTER_FLAG_TSYNC`] is the one that matters most.
-const SUPPORTED_FILTER_FLAGS: u32 = 0;
+/// A caller that passes a flag installation ignores is left believing the
+/// filter does more than it does, so a flag is accepted only when ignoring it
+/// cannot mislead anyone. `SPEC_ALLOW` is such a flag, and the two `TSYNC` ones
+/// are acted on rather than ignored.
+const SUPPORTED_FILTER_FLAGS: u32 =
+    SECCOMP_FILTER_FLAG_TSYNC | SECCOMP_FILTER_FLAG_SPEC_ALLOW | SECCOMP_FILTER_FLAG_TSYNC_ESRCH;
 
 /// Syncs the filter to every thread of the thread group, rather than confining
 /// only the thread that installs it.
 ///
-/// This is not implemented, and it is named here on purpose: it is what a
-/// sandbox runtime passes when it sets up a container, and it is the difference
-/// between a process being confined and only one of its threads being confined.
-/// Refusing the flag leaves a caller that asks for it in no doubt about what it
-/// got, and this constant is the one place that has to change to support it.
+/// This is what a sandbox runtime passes when it sets up a container, and it is
+/// the difference between a process being confined and only one of its threads
+/// being confined: a system call can be made from any of them, so a filter that
+/// one thread holds is not a filter on the process.
+///
+/// A thread group is not always one that can be confined. The other threads may
+/// hold filters of their own, and a thread whose filters the new one is not
+/// installed on top of would have one taken away from it by the sync, which
+/// seccomp never does. When that is the case nothing is installed on any
+/// thread, and the system call reports the id of a thread that stood in the
+/// way: a failure is not an error number here, since what the caller needs to
+/// know is *which* thread it was, and `-1` cannot say.
 const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1 << 0;
+
+/// Reports a thread that had to be left out of a sync as `ESRCH` rather than as
+/// its id.
+///
+/// The id is more useful, but it is also a positive value that a caller may
+/// mistake for the zero of success, so this flag is there for a caller that
+/// wants a failure to be one that cannot be missed. It means nothing on its
+/// own, and Linux accepts it on its own all the same.
+const SECCOMP_FILTER_FLAG_TSYNC_ESRCH: u32 = 1 << 4;
+
+/// Asks for the speculation barrier that a filter would otherwise run behind to
+/// be left out.
+///
+/// The flag is accepted and acted on by doing nothing, which is what Linux does
+/// on a machine that has no such barrier to install. Linux reads it in exactly
+/// one place, `seccomp_assign_mode`, and only to decide whether to call
+/// `arch_seccomp_spec_mitigate()`; that function's own definition is empty and
+/// an architecture overrides it only if it has a barrier to turn on. Asterinas'
+/// interpreter runs the program directly and has none, so the flag has nothing
+/// to switch off and refusing it would report a difference where there is none.
+/// See <https://elixir.bootlin.com/linux/v6.18/source/kernel/seccomp.c>.
+const SECCOMP_FILTER_FLAG_SPEC_ALLOW: u32 = 1 << 2;
 
 /// The actions that `SECCOMP_GET_ACTION_AVAIL` reports as available.
 ///
@@ -69,7 +102,7 @@ pub(super) fn sys_seccomp(
             enter_strict_mode(ctx)?;
         }
         SECCOMP_SET_MODE_FILTER => {
-            install_filter(ctx, flags, args)?;
+            return Ok(SyscallReturn::Return(install_filter(ctx, flags, args)?));
         }
         SECCOMP_GET_ACTION_AVAIL => {
             if flags != 0 {
@@ -124,17 +157,14 @@ pub(crate) fn enter_strict_mode(ctx: &Context) -> Result<()> {
 ///
 /// The order in which this can fail is the one Linux uses: the flags first, then
 /// the program description as it is read out of user memory, then the length of
-/// the program, then the permission to install one, and only then the program
-/// itself.
-pub(crate) fn install_filter(ctx: &Context, flags: u32, fprog_addr: Vaddr) -> Result<()> {
+/// the program, then the permission to install one, then the program itself, and
+/// last the threads that would have to adopt it.
+///
+/// Returns what the system call reports, which is `0` when all went well, and
+/// otherwise the id of a thread that could not be confined: see
+/// [`SECCOMP_FILTER_FLAG_TSYNC`].
+pub(crate) fn install_filter(ctx: &Context, flags: u32, fprog_addr: Vaddr) -> Result<isize> {
     if flags & !SUPPORTED_FILTER_FLAGS != 0 {
-        // The flag that a sandbox runtime passes and that it is most important
-        // to say no to gets an answer of its own, since a caller that asked for
-        // it is the one that would otherwise believe the whole thread group is
-        // confined.
-        if flags & SECCOMP_FILTER_FLAG_TSYNC != 0 {
-            return_errno_with_message!(Errno::EINVAL, "SECCOMP_FILTER_FLAG_TSYNC is not supported");
-        }
         return_errno_with_message!(Errno::EINVAL, "the filter flags are not supported");
     }
 
@@ -165,7 +195,100 @@ pub(crate) fn install_filter(ctx: &Context, flags: u32, fprog_addr: Vaddr) -> Re
     let program = read_program(ctx, fprog.filter, fprog.len as usize)?;
     let program = verify(program)?;
 
-    ctx.posix_thread.seccomp().attach_filter(program)
+    if flags & SECCOMP_FILTER_FLAG_TSYNC == 0 {
+        ctx.posix_thread.seccomp().attach_filter(program)?;
+        return Ok(0);
+    }
+
+    confine_thread_group(ctx, program, flags & SECCOMP_FILTER_FLAG_TSYNC_ESRCH != 0)
+}
+
+/// Confines every thread of the calling thread's group with `program`, which is
+/// what `SECCOMP_FILTER_FLAG_TSYNC` asks for, and returns what the system call
+/// reports.
+fn confine_thread_group(ctx: &Context, program: Program, report_esrch: bool) -> Result<isize> {
+    let seccomp = ctx.posix_thread.seccomp();
+
+    // The group's list of threads is held from here to the end of the sync: a
+    // thread created while this runs would be one that the checks below never
+    // saw, and it would come into being unconfined. Linux holds the lock that
+    // guards the same thing for the same reason.
+    let tasks = ctx.process.tasks().lock();
+
+    // The filter is built before any thread is looked at. The checks it makes
+    // can turn the whole operation down on their own, and Linux makes them
+    // before it looks at a thread as well, so that a request that is over the
+    // instruction limit is refused for that reason rather than for whichever
+    // thread happens to be first in the list.
+    //
+    // Nothing has been installed on any thread at this point.
+    let filter = seccomp.prepare_attach(program)?;
+
+    // Every thread has to be one that can be moved onto the new chain, or none
+    // of them is moved: a group that is half confined is one in which the
+    // caller's filter can be stepped around by making the system call from
+    // another thread, which is the state the caller asked to avoid.
+    for task in tasks.as_slice() {
+        let Some(thread) = task.as_posix_thread() else {
+            continue;
+        };
+
+        // The calling thread is the one the others are measured against, so it
+        // is not one of the threads to be measured, and it is confined below.
+        if core::ptr::eq(thread, ctx.posix_thread) {
+            continue;
+        }
+
+        // A thread that has exited is left out. It is not one that can be made
+        // to bypass anything, and its filters are on their way out with it.
+        if task.as_thread().is_some_and(|thread| thread.is_exited()) {
+            continue;
+        }
+
+        if thread.seccomp().can_adopt(&filter) {
+            continue;
+        }
+
+        // The thread that stood in the way is what the caller is told about,
+        // since which thread it was is what tells the caller what to do about
+        // it.
+        if report_esrch {
+            return_errno_with_message!(Errno::ESRCH, "a thread cannot be confined");
+        }
+        return Ok(thread.tid() as isize);
+    }
+
+    // Nothing has failed, so the filter is installed on the calling thread
+    // first and on the rest of the group after it, which is the order Linux
+    // uses.
+    seccomp.commit_attach(&filter)?;
+
+    // Whether the promise is copied is decided once, from the thread that made
+    // it, since installing a filter may only be done by a thread that has made
+    // it or that holds `CAP_SYS_ADMIN`, and a group is confined as one.
+    let copy_no_new_privs = ctx.posix_thread.credentials().no_new_privs();
+
+    for task in tasks.as_slice() {
+        let Some(thread) = task.as_posix_thread() else {
+            continue;
+        };
+        if core::ptr::eq(thread, ctx.posix_thread)
+            || task.as_thread().is_some_and(|thread| thread.is_exited())
+        {
+            continue;
+        }
+
+        thread.seccomp().adopt_filter(&filter);
+
+        // A thread that holds a filter without having made the promise could
+        // exec a program that gains privileges, which is what the promise is
+        // there to prevent, so the promise is copied along with the filter.
+        if copy_no_new_privs {
+            thread.set_no_new_privs();
+        }
+    }
+
+    Ok(0)
 }
 
 /// Returns whether the calling thread holds `CAP_SYS_ADMIN` over its user

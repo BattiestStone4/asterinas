@@ -85,7 +85,9 @@ pub(super) fn sys_prctl(
         }
         PrctlCmd::PR_SET_SECCOMP_FILTER(filter) => {
             // `PR_SET_SECCOMP` predates the filter flags, so it has none, as
-            // Linux notes when it forwards to `do_seccomp`.
+            // Linux notes when it forwards to `do_seccomp`. Without them the
+            // filter confines only the calling thread, so there is no thread id
+            // to report and nothing to do with the return value.
             install_filter(ctx, 0, filter)?;
         }
         PrctlCmd::PR_CAPBSET_READ(capability) => {

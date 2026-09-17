@@ -33,24 +33,63 @@
 #define REPORT_INSTALL_FAILED 'F'
 
 /**
- * Fills `program` with a four-instruction filter that refuses `getpid(2)` with
- * `verdict`, and allows every other system call.
+ * Fills `program` with a four-instruction filter that refuses the system call
+ * numbered `syscall_nr` with `verdict`, and allows every other system call.
  *
- * `getpid(2)` is the system call the tests use to reach the filter: it takes no
- * arguments and has no effect, so a filter that refuses it can be told apart
- * from one that does not, without anything else in the process changing.
+ * The calls these tests name are ones that take no arguments and have no
+ * effect, so a filter that refuses one of them can be told apart from one that
+ * does not without anything else in the process changing, and the refusal
+ * cannot be confused with a failure of the kernel's: nothing else about such a
+ * call can fail with `EPERM`.
  */
-static void build_refuse_getpid(struct sock_filter *program,
-				unsigned int verdict)
+static void build_refuse_syscall(struct sock_filter *program,
+				 unsigned int syscall_nr, unsigned int verdict)
 {
 	struct sock_filter body[] = {
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getpid, 0, 1),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, syscall_nr, 0, 1),
 		BPF_STMT(BPF_RET | BPF_K, verdict),
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 	};
 
 	memcpy(program, body, sizeof(body));
+}
+
+/** The number of instructions `build_refuse_syscall` fills in. */
+#define REFUSE_SYSCALL_PROGRAM_LEN 4
+
+/**
+ * Fills `program` with a filter that refuses `getpid(2)` with `verdict` and
+ * allows every other system call.
+ *
+ * `getpid(2)` is the system call most of the tests reach a filter with, since a
+ * test needs its own pid to report anything at all.
+ */
+static void build_refuse_getpid(struct sock_filter *program,
+				unsigned int verdict)
+{
+	build_refuse_syscall(program, SYS_getpid, verdict);
+}
+
+/**
+ * Returns whether `getpid(2)` is refused, which only a filter can do: the call
+ * has no failure of its own, so `EPERM` can only have come from one.
+ */
+static int getpid_is_refused(void)
+{
+	errno = 0;
+	long ret = syscall(SYS_getpid);
+
+	return ret == -1 && errno == EPERM;
+}
+
+/**`getppid(2)`, which fails for no other reason either. */
+static int getppid_is_refused(void)
+{
+	errno = 0;
+	long ret = syscall(SYS_getppid);
+
+	return ret == -1 && errno == EPERM;
 }
 
 /**
@@ -393,13 +432,15 @@ FN_TEST(an_errno_verdict_fails_the_syscall_it_names)
 			 */
 			errno = 0;
 			long refused = syscall(SYS_getpid);
+			int refused_errno = errno;
 
 			/* A system call the filter does not name is dispatched
 			 * as usual. */
 			errno = 0;
 			long allowed = syscall(SYS_getppid);
 
-			if (refused == -1 && errno == 0 && allowed >= 0) {
+			if (refused == -1 && refused_errno == EPERM &&
+			    allowed >= 0) {
 				report = 'S';
 			} else if (refused != -1) {
 				report = 'N';
@@ -1121,6 +1162,110 @@ FN_TEST(a_program_of_the_wrong_length_is_rejected)
 }
 END_TEST()
 
+/*
+ * The flag asks for the speculation barrier that a system call would otherwise
+ * run behind to be left out. It says how the filter is run rather than what it
+ * says, so a filter installed with it is the same filter: the installation is
+ * accepted, and the calls it names are refused exactly as they would have been
+ * without it.
+ *
+ * A kernel with no such barrier to leave out has nothing to do for the flag and
+ * accepts it all the same, which is what Linux does on an architecture whose
+ * system calls are not run under one.
+ */
+FN_TEST(a_filter_installed_with_spec_allow_is_still_enforced)
+{
+	SKIP_IF_CONFINED();
+
+	int ready_pipe[2];
+	TEST_SUCC(pipe(ready_pipe));
+
+	pid_t child = TEST_SUCC(fork());
+	if (child == 0) {
+		close(ready_pipe[0]);
+
+		/*
+		 * The filter refuses `getpid(2)`, which is the call the test
+		 * process needs in order to report anything at all, so the
+		 * thread's own pid is taken while the call still reaches the
+		 * kernel.
+		 */
+		pid_t self = getpid();
+
+		struct sock_filter program[4];
+		build_refuse_getpid(program, SECCOMP_RET_ERRNO | EPERM);
+
+		char report = REPORT_INSTALL_FAILED;
+		if (allow_confining_this_thread() == 0 &&
+		    install_filter(program, 4,
+				   SECCOMP_FILTER_FLAG_SPEC_ALLOW) == 0 &&
+		    read_seccomp_mode(self) == 2) {
+			/*
+			 * The errno is the filter's, not the kernel's:
+			 * `getpid(2)` has no failure of its own, so reaching
+			 * `EPERM` means the call was refused rather than
+			 * dispatched, with the flag in effect.
+			 */
+			errno = 0;
+			long refused = syscall(SYS_getpid);
+			int refused_errno = errno;
+
+			/* A call the filter does not name is dispatched as
+			 * usual. */
+			errno = 0;
+			long allowed = syscall(SYS_getppid);
+
+			if (refused == -1 && refused_errno == EPERM &&
+			    allowed >= 0) {
+				report = REPORT_INSTALLED;
+			} else if (refused != -1) {
+				report = REPORT_NOT_ENFORCED;
+			}
+		}
+
+		if (write(ready_pipe[1], &report, 1) != 1) {
+			syscall(SYS_exit, EXIT_FAILURE);
+		}
+		exit(EXIT_SUCCESS);
+	}
+
+	close(ready_pipe[1]);
+
+	char report = '\0';
+	TEST_RES(read(ready_pipe[0], &report, 1),
+		 _ret == 1 && report == REPORT_INSTALLED);
+
+	int status = 0;
+	TEST_SUCC(waitpid(child, &status, 0));
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	CHECK(close(ready_pipe[0]));
+}
+END_TEST()
+
+/*
+ * The flag is accepted because it is one the ABI defines, rather than because
+ * the check for the flags was loosened: a bit the ABI leaves undefined is
+ * refused even when it arrives beside one that is defined. The flags are checked
+ * before anything else about the caller is, so a refusal here needs neither
+ * `no_new_privs` nor a capability to be reached.
+ */
+FN_TEST(an_undefined_flag_is_refused_even_beside_a_defined_one)
+{
+	SKIP_IF_CONFINED();
+
+	struct sock_filter program[4];
+	build_refuse_getpid(program, SECCOMP_RET_ERRNO | EPERM);
+
+	/* A bit above the highest one the ABI gives a meaning to. */
+	const unsigned int undefined_flag = 1u << 20;
+
+	TEST_ERRNO(install_filter(program, 4,
+				  SECCOMP_FILTER_FLAG_SPEC_ALLOW |
+					  undefined_flag),
+		   EINVAL);
+}
+END_TEST()
+
 FN_TEST(too_many_filters_in_a_chain_are_refused)
 {
 	SKIP_IF_CONFINED();
@@ -1204,5 +1349,375 @@ FN_TEST(the_core_actions_are_reported_as_available)
 	unknown = 0xdeadbeef;
 	TEST_ERRNO(syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &unknown),
 		   EOPNOTSUPP);
+}
+END_TEST()
+
+/*
+ * `SECCOMP_FILTER_FLAG_TSYNC` confines the whole thread group with the filter
+ * rather than only the thread that installs it, which is what makes a filter a
+ * property of a process: a system call can be made from any of its threads, so
+ * a filter that one thread holds is not a filter on the process.
+ *
+ * The tests below all run the same shape of process: a child whose first thread
+ * creates a sibling, the two meet at a barrier, the first thread installs a
+ * filter that refuses `getpid(2)`, and then both report what they see. What
+ * differs between them is what the sibling does around the sync, which is the
+ * part of the protocol the sync has to get right.
+ *
+ * The child reports through a pipe rather than through its exit status, because
+ * a synced filter confines the thread that would be doing the reporting: the
+ * filter refuses `getpid(2)` and nothing else, so the pipe and the exit still
+ * work, but the report is written before either in any case.
+ */
+
+/* What one thread group reported about a synced installation. */
+struct tsync_result {
+	/* What `seccomp(2)` reported: `0`, or a thread id, or `-1` with the
+	 * reason in `sync_errno`. */
+	long sync_ret;
+	int sync_errno;
+
+	/* The sibling's thread id, which is what a failed sync names. */
+	pid_t sibling_tid;
+
+	/* Whether `getpid(2)` is refused in each thread, which is how the
+	 * confinement the sync installs is observed. */
+	int main_refused;
+	int sibling_refused;
+
+	/* Whether `getppid(2)` is refused, which only a filter the tests
+	 * install separately does. */
+	int main_own_refused;
+	int sibling_own_refused;
+
+	/* The sibling's `no_new_privs`, before the sync and after it. */
+	int sibling_nnp_before;
+	int sibling_nnp_after;
+};
+
+/* What the sibling of a synced installation is asked to do around the sync. */
+struct tsync_options {
+	/* Whether the sibling confines itself with a `getppid(2)`-refusing
+	 * filter before the first thread installs anything. */
+	int installs_first;
+
+	/* Whether it installs that filter after the sync instead, which it may
+	 * only do if the sync carried `no_new_privs` to it. */
+	int installs_after;
+};
+
+struct tsync_probe {
+	const struct tsync_options *options;
+	struct tsync_result *result;
+	pthread_barrier_t ready;
+	pthread_barrier_t release;
+};
+
+static void *tsync_sibling(void *arg)
+{
+	struct tsync_probe *probe = arg;
+	struct tsync_result *result = probe->result;
+
+	struct sock_filter program[REFUSE_SYSCALL_PROGRAM_LEN];
+	build_refuse_syscall(program, SYS_getppid, SECCOMP_RET_ERRNO | EPERM);
+
+	/*
+	 * The id and the promise are read while nothing has been installed on
+	 * this thread: the first thread waits for this thread to reach the
+	 * barrier before it installs anything, so what is read here is the
+	 * state the sync starts from. `no_new_privs` is a property of a thread
+	 * and is not shared with the one that created this one, so it is read
+	 * here rather than taken from anywhere else.
+	 */
+	result->sibling_tid = (pid_t)syscall(SYS_gettid);
+	result->sibling_nnp_before = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+
+	/*
+	 * A thread that confines itself here holds a filter of its own by the
+	 * time the sync runs, which is a filter the sync may not take away
+	 * from it.
+	 */
+	if (probe->options->installs_first) {
+		if (allow_confining_this_thread() == 0 &&
+		    install_filter(program, REFUSE_SYSCALL_PROGRAM_LEN, 0) ==
+			    0) {
+			result->sibling_own_refused = getppid_is_refused();
+		}
+	}
+
+	CHECK_WITH(pthread_barrier_wait(&probe->ready),
+		   _ret == 0 || _ret == PTHREAD_BARRIER_SERIAL_THREAD);
+	CHECK_WITH(pthread_barrier_wait(&probe->release),
+		   _ret == 0 || _ret == PTHREAD_BARRIER_SERIAL_THREAD);
+
+	/* The sync is over by the time the barrier releases this thread. */
+	result->sibling_refused = getpid_is_refused();
+	result->sibling_nnp_after = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+
+	/*
+	 * The promise is deliberately not made here. A thread holds a filter
+	 * only if it has made the promise or holds `CAP_SYS_ADMIN`, and this
+	 * thread holds neither on its own: that it can be confined further is
+	 * what the sync did for it.
+	 */
+	if (probe->options->installs_after) {
+		if (install_filter(program, REFUSE_SYSCALL_PROGRAM_LEN, 0) ==
+		    0) {
+			result->sibling_own_refused = getppid_is_refused();
+		}
+	}
+
+	return NULL;
+}
+
+/**
+ * Runs one synced installation in a child process.
+ *
+ * The child's first thread creates a sibling, waits for it to reach a barrier,
+ * installs a filter that refuses `getpid(2)` with `flags`, and then releases the
+ * sibling and reports what the two of them saw to `out`. The status the child
+ * was waited for with is written to `out_status`.
+ *
+ * Returns 1 if the child lived to report, and 0 if it died first, in which case
+ * `out` is left with a failure in it.
+ */
+static int run_tsync(unsigned int flags, const struct tsync_options *options,
+		     struct tsync_result *out, int *out_status)
+{
+	int report_pipe[2];
+	CHECK(pipe(report_pipe));
+
+	pid_t child = CHECK(fork());
+	if (child == 0) {
+		close(report_pipe[0]);
+
+		struct tsync_result result = { 0 };
+		struct tsync_probe probe = {
+			.options = options,
+			.result = &result,
+		};
+		CHECK(pthread_barrier_init(&probe.ready, NULL, 2));
+		CHECK(pthread_barrier_init(&probe.release, NULL, 2));
+
+		pthread_t sibling;
+		if (pthread_create(&sibling, NULL, tsync_sibling, &probe) !=
+		    0) {
+			syscall(SYS_exit, EXIT_FAILURE);
+		}
+
+		CHECK_WITH(pthread_barrier_wait(&probe.ready),
+			   _ret == 0 || _ret == PTHREAD_BARRIER_SERIAL_THREAD);
+
+		/*
+		 * The promise is made only now, once the sibling exists, so
+		 * that the sibling was born without it: whatever carries it
+		 * there is the sync, and nothing else.
+		 */
+		CHECK(allow_confining_this_thread());
+
+		struct sock_filter program[REFUSE_SYSCALL_PROGRAM_LEN];
+		build_refuse_getpid(program, SECCOMP_RET_ERRNO | EPERM);
+
+		errno = 0;
+		result.sync_ret = install_filter(
+			program, REFUSE_SYSCALL_PROGRAM_LEN, flags);
+		result.sync_errno = errno;
+
+		CHECK_WITH(pthread_barrier_wait(&probe.release),
+			   _ret == 0 || _ret == PTHREAD_BARRIER_SERIAL_THREAD);
+		CHECK(pthread_join(sibling, NULL));
+
+		result.main_refused = getpid_is_refused();
+		result.main_own_refused = getppid_is_refused();
+
+		CHECK(pthread_barrier_destroy(&probe.ready));
+		CHECK(pthread_barrier_destroy(&probe.release));
+
+		/*
+		 * The report is small enough for the write to be atomic, so
+		 * the reader sees all of it or none of it.
+		 */
+		if (write(report_pipe[1], &result, sizeof(result)) !=
+		    (ssize_t)sizeof(result)) {
+			syscall(SYS_exit, EXIT_FAILURE);
+		}
+		exit(EXIT_SUCCESS);
+	}
+
+	close(report_pipe[1]);
+
+	struct tsync_result result = { 0 };
+	ssize_t len = read(report_pipe[0], &result, sizeof(result));
+	CHECK(close(report_pipe[0]));
+
+	int status = 0;
+	CHECK(waitpid(child, &status, 0));
+	*out_status = status;
+
+	if (len == (ssize_t)sizeof(result)) {
+		*out = result;
+		return 1;
+	}
+
+	memset(out, 0, sizeof(*out));
+	out->sync_ret = -1;
+	return 0;
+}
+
+/*
+ * The flag does what it says: the filter confines the sibling as well as the
+ * thread that installed it. Without it the sibling is left free to make the
+ * very calls the filter refuses, so this is the difference between confining a
+ * process and confining one of its threads.
+ */
+FN_TEST(syncing_a_filter_confines_every_thread_of_the_group)
+{
+	SKIP_IF_CONFINED();
+
+	struct tsync_options options = { 0 };
+	struct tsync_result result;
+	int status = 0;
+
+	TEST_RES(run_tsync(SECCOMP_FILTER_FLAG_TSYNC, &options, &result,
+			   &status),
+		 _ret == 1);
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	/* The installation succeeded, with nothing to report about it. */
+	TEST_RES(result.sync_ret, result.sync_ret == 0);
+
+	/* It confined the thread that installed it ... */
+	TEST_RES(result.main_refused, result.main_refused == 1);
+
+	/* ... and the one that did not. */
+	TEST_RES(result.sibling_refused, result.sibling_refused == 1);
+}
+END_TEST()
+
+/*
+ * A thread group is not always one that can be confined. A thread that holds
+ * filters of its own can only be moved onto a chain that has those filters on
+ * it, and taking one away from a thread is not something seccomp does. When
+ * that is the case nothing is installed on any thread, and the caller is told
+ * which thread stood in the way: the id is the useful answer, since it is what
+ * says where to look, and `-1` could not carry it.
+ */
+FN_TEST(a_thread_that_cannot_be_synced_is_named_by_the_sync)
+{
+	SKIP_IF_CONFINED();
+
+	struct tsync_options options = { .installs_first = 1 };
+	struct tsync_result result;
+	int status = 0;
+
+	TEST_RES(run_tsync(SECCOMP_FILTER_FLAG_TSYNC, &options, &result,
+			   &status),
+		 _ret == 1);
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	TEST_RES(result.sync_ret, result.sync_ret == result.sibling_tid);
+
+	/*
+	 * Nothing was installed anywhere: a group that is half confined is one
+	 * in which the filter can be stepped around by making the system call
+	 * from the thread that does not hold it, which is the state the caller
+	 * asked to avoid.
+	 */
+	TEST_RES(result.main_refused, result.main_refused == 0);
+	TEST_RES(result.sibling_refused, result.sibling_refused == 0);
+
+	/* And the sibling kept the filter it had. */
+	TEST_RES(result.sibling_own_refused, result.sibling_own_refused == 1);
+}
+END_TEST()
+
+/*
+ * The same failure, reported the other way. The id is the more useful answer,
+ * but it is also a positive value that a caller could mistake for the zero of
+ * success, so a caller that would rather not have one asks for this instead.
+ */
+FN_TEST(a_sync_that_cannot_be_made_can_report_esrch_instead)
+{
+	SKIP_IF_CONFINED();
+
+	struct tsync_options options = { .installs_first = 1 };
+	struct tsync_result result;
+	int status = 0;
+
+	TEST_RES(run_tsync(SECCOMP_FILTER_FLAG_TSYNC |
+				   SECCOMP_FILTER_FLAG_TSYNC_ESRCH,
+			   &options, &result, &status),
+		 _ret == 1);
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	TEST_RES(result.sync_ret, result.sync_ret == -1);
+	TEST_RES(result.sync_errno, result.sync_errno == ESRCH);
+
+	/* The same failure and the same outcome: nothing was installed. */
+	TEST_RES(result.main_refused, result.main_refused == 0);
+	TEST_RES(result.sibling_refused, result.sibling_refused == 0);
+}
+END_TEST()
+
+/*
+ * The promise that the group will not gain privileges travels with the filter.
+ * A thread that holds a filter without having made the promise could `exec` a
+ * program that gains privileges, which is what the promise is there to prevent,
+ * and a group is confined as one: the sync makes the promise for the threads it
+ * confines, exactly as Linux does in `seccomp_sync_threads`.
+ *
+ * The sibling here is born without the promise, because the thread that installs
+ * makes it only once the sibling exists, so a promise found afterwards can only
+ * have come from the sync.
+ */
+FN_TEST(the_sync_carries_no_new_privs_to_the_threads_it_confines)
+{
+	SKIP_IF_CONFINED();
+
+	struct tsync_options options = { 0 };
+	struct tsync_result result;
+	int status = 0;
+
+	TEST_RES(run_tsync(SECCOMP_FILTER_FLAG_TSYNC, &options, &result,
+			   &status),
+		 _ret == 1);
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	TEST_RES(result.sibling_nnp_before, result.sibling_nnp_before == 0);
+	TEST_RES(result.sibling_nnp_after, result.sibling_nnp_after == 1);
+}
+END_TEST()
+
+/*
+ * The promise is what lets a confined thread confine itself further, and the
+ * sync is what gave it to this one: the sibling installs a second filter
+ * without making the promise itself, which it could not do on its own.
+ *
+ * The result is a thread held by both filters, which is the point of the whole
+ * operation: the group's filter and the thread's own, with no thread left to
+ * make the call from.
+ */
+FN_TEST(a_synced_thread_can_extend_its_own_confinement)
+{
+	SKIP_IF_CONFINED();
+
+	struct tsync_options options = { .installs_after = 1 };
+	struct tsync_result result;
+	int status = 0;
+
+	TEST_RES(run_tsync(SECCOMP_FILTER_FLAG_TSYNC, &options, &result,
+			   &status),
+		 _ret == 1);
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	/* The sync confined the sibling ... */
+	TEST_RES(result.sibling_refused, result.sibling_refused == 1);
+
+	/* ... and let it confine itself further. */
+	TEST_RES(result.sibling_own_refused, result.sibling_own_refused == 1);
+
+	/* What the sibling added is its own, and does not reach the rest. */
+	TEST_RES(result.main_refused, result.main_refused == 1);
+	TEST_RES(result.main_own_refused, result.main_own_refused == 0);
 }
 END_TEST()

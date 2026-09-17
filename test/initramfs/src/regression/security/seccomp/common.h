@@ -35,6 +35,22 @@
 #define SECCOMP_MODE_STRICT 1
 #define SECCOMP_MODE_FILTER 2
 
+/* Confines every thread of the calling thread's group with the filter, rather
+ * than only the thread that installs it. */
+#define SECCOMP_FILTER_FLAG_TSYNC (1U << 0)
+
+/* Asks for the speculation barrier that the system call behind the filter would
+ * otherwise run behind to be left out. It is a hint about performance rather
+ * than about what the filter does: a filter installed with it refuses exactly
+ * the same calls as one installed without it. */
+#define SECCOMP_FILTER_FLAG_SPEC_ALLOW (1U << 2)
+
+/* Reports a thread that a `TSYNC` could not confine as `ESRCH` rather than as
+ * the thread's id. It means nothing on its own, and the two flags go together:
+ * it is the id that is useful, and this is for a caller that would rather not
+ * have a positive value to tell apart from the zero of success. */
+#define SECCOMP_FILTER_FLAG_TSYNC_ESRCH (1U << 4)
+
 /* Older versions of `<sys/syscall.h>` may not define this. */
 #ifndef SYS_seccomp
 #define SYS_seccomp 317

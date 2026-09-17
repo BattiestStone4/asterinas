@@ -311,6 +311,18 @@ impl PosixThread {
         &self.seccomp
     }
 
+    /// Makes the promise that this thread will not gain any privileges.
+    ///
+    /// The promise only ever takes away from what a thread may do, so making it
+    /// for another thread needs no capability: it is a statement about what the
+    /// thread will not be able to do, and the thread cannot object to it.
+    /// `SECCOMP_FILTER_FLAG_TSYNC` makes it for every thread of the group it
+    /// confines, so that a thread cannot escape it by having another thread
+    /// make it, which is what Linux does in `seccomp_sync_threads`.
+    pub(crate) fn set_no_new_privs(&self) {
+        self.credentials.set_no_new_privs();
+    }
+
     /// Gets the duplicatable read-only credentials of the thread.
     pub(crate) fn credentials_dup(&self) -> Credentials<ReadDupOp> {
         self.credentials.dup().restrict()

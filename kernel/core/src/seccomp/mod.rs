@@ -24,7 +24,7 @@ mod verifier;
 // it reads out of user memory, the instructions it is made of, the length they
 // may not exceed, and the check they have to pass before the filter may run.
 pub(crate) use bpf::{BPF_MAXINSNS, SockFilter, SockFprog};
-use interpreter::Program;
+pub(crate) use interpreter::Program;
 pub(crate) use verifier::verify;
 
 /// The verdicts a filter may reach, as the seccomp ABI encodes them.
@@ -202,6 +202,33 @@ pub(crate) struct SeccompFilter {
     prev: Option<Arc<SeccompFilter>>,
 }
 
+/// Returns whether `parent` is one of the filters on the chain that `child`
+/// names.
+///
+/// A chain is a path through the filters of a thread, from the newest to the
+/// oldest, and two threads that forked from one another share the nodes of the
+/// part they have in common. So asking whether one chain reaches back to a
+/// filter that another chain holds is asking whether the second chain is an
+/// extension of the first, which is what makes it safe for the second thread to
+/// hand its chain to the first.
+///
+/// A chain with no filters is below every other chain, so `None` is the
+/// ancestor of everything.
+fn is_ancestor(parent: Option<&Arc<SeccompFilter>>, child: Option<&Arc<SeccompFilter>>) -> bool {
+    let Some(parent) = parent else {
+        return true;
+    };
+
+    let mut node = child;
+    while let Some(filter) = node {
+        if Arc::ptr_eq(filter, parent) {
+            return true;
+        }
+        node = filter.prev.as_ref();
+    }
+    false
+}
+
 /// The seccomp state of a thread.
 pub(crate) struct SeccompState {
     /// The current [`SeccompMode`], stored as its raw value.
@@ -252,6 +279,21 @@ impl SeccompState {
     /// Returns `EINVAL` if the thread is in the strict mode, which no filter can
     /// be added to.
     pub(crate) fn attach_filter(&self, program: Program) -> Result<()> {
+        let filter = self.prepare_attach(program)?;
+
+        self.commit_attach(&filter)
+    }
+
+    /// Builds the node that installing `program` would put in front of the
+    /// thread's filters, without installing it.
+    ///
+    /// Everything that can turn an installation down is checked here and
+    /// nowhere else, so that a caller which has to know the outcome before it
+    /// changes anything can ask first. `SECCOMP_FILTER_FLAG_TSYNC` is such a
+    /// caller: it may only confine the other threads of a group once it knows
+    /// that all of them can be confined, and a thread it cannot confine has to
+    /// leave the group as it found it.
+    pub(crate) fn prepare_attach(&self, program: Program) -> Result<Arc<SeccompFilter>> {
         // The mode has to be checked before anything is attached. Attaching
         // first and letting `set_mode` fail would leave the chain holding a
         // filter that nothing will ever run.
@@ -262,38 +304,86 @@ impl SeccompState {
             );
         }
 
-        {
-            let mut filters = self.filters.lock();
+        let prev = self.filters.lock().clone();
 
-            // A thread may hold any number of filters, but only up to a limit on
-            // how much running them can cost, and reaching it fails with
-            // `ENOMEM` rather than `EINVAL`: the filters are each valid, there
-            // are simply too many of them.
-            //
-            // Linux adds up the lengths of the *converted* programs here, since
-            // those are what it runs and converting inflates them. The programs
-            // here run as they were written, so the count is of the instructions
-            // as written, and this limit is therefore reached later than Linux's
-            // would be.
-            let mut total = program.len();
-            let mut next = filters.as_ref();
-            while let Some(filter) = next {
-                total += filter.program.len() + INSN_PENALTY_PER_FILTER;
-                next = filter.prev.as_ref();
-            }
-            if total > MAX_INSNS_PER_PATH {
-                return_errno_with_message!(Errno::ENOMEM, "the thread has too many filters");
-            }
-
-            let prev = filters.take();
-            *filters = Some(Arc::new(SeccompFilter { program, prev }));
+        // A thread may hold any number of filters, but only up to a limit on
+        // how much running them can cost, and reaching it fails with
+        // `ENOMEM` rather than `EINVAL`: the filters are each valid, there
+        // are simply too many of them.
+        //
+        // Linux adds up the lengths of the *converted* programs here, since
+        // those are what it runs and converting inflates them. The programs
+        // here run as they were written, so the count is of the instructions
+        // as written, and this limit is therefore reached later than Linux's
+        // would be.
+        let mut total = program.len();
+        let mut next = prev.as_ref();
+        while let Some(filter) = next {
+            total += filter.program.len() + INSN_PENALTY_PER_FILTER;
+            next = filter.prev.as_ref();
         }
+        if total > MAX_INSNS_PER_PATH {
+            return_errno_with_message!(Errno::ENOMEM, "the thread has too many filters");
+        }
+
+        Ok(Arc::new(SeccompFilter { program, prev }))
+    }
+
+    /// Installs a filter built by [`Self::prepare_attach`] on the thread.
+    ///
+    /// Returns `EINVAL` if the thread is in the strict mode, which
+    /// [`Self::prepare_attach`] has already turned down, so that a caller which
+    /// has called it cannot see this failure.
+    pub(crate) fn commit_attach(&self, filter: &Arc<SeccompFilter>) -> Result<()> {
+        *self.filters.lock() = Some(filter.clone());
 
         // The chain is filled in before the mode is published, so that a system
         // call which reads the filter mode is guaranteed to find the filter it
         // is supposed to run. Installing on top of an existing filter finds the
         // mode already set, which `set_mode` accepts.
         self.set_mode(SeccompMode::Filter)
+    }
+
+    /// Returns whether this thread can be moved onto the chain of filters that
+    /// `filter` is the head of.
+    ///
+    /// This is the question `SECCOMP_FILTER_FLAG_TSYNC` puts to every thread of
+    /// a group before it confines any of them. A thread can be moved if its own
+    /// filters are among the ones that `filter` is installed on top of, so that
+    /// the move only ever adds to what it is confined by; a thread that has no
+    /// filter at all has nothing to lose and can always be moved. A thread in
+    /// the strict mode cannot: a filter is not something that mode can hold.
+    ///
+    /// The filters are compared by identity, not by what the programs in them
+    /// say. Two threads that installed equal programs still hold two different
+    /// filters, and neither is an ancestor of the other, because a filter is
+    /// only ever added to per thread: what makes one chain an extension of
+    /// another is that the threads share the nodes, which they do when one of
+    /// them forked from the other.
+    pub(crate) fn can_adopt(&self, filter: &Arc<SeccompFilter>) -> bool {
+        match self.mode() {
+            SeccompMode::Disabled => true,
+            SeccompMode::Filter => is_ancestor(self.filters.lock().as_ref(), Some(filter)),
+            SeccompMode::Strict => false,
+        }
+    }
+
+    /// Moves this thread onto the chain of filters that `filter` is the head
+    /// of, which is how `SECCOMP_FILTER_FLAG_TSYNC` confines the threads of a
+    /// group with the filter one of them installed.
+    ///
+    /// The caller has to have established with [`Self::can_adopt`] that this
+    /// thread is a thread that can be moved.
+    pub(crate) fn adopt_filter(&self, filter: &Arc<SeccompFilter>) {
+        *self.filters.lock() = Some(filter.clone());
+
+        // The chain is filled in before the mode is published here as well, for
+        // the reason given in `commit_attach`.
+        //
+        // This cannot fail: the strict mode is the one mode `set_mode` turns
+        // down, and a thread in it is one that `can_adopt` refuses to move.
+        self.set_mode(SeccompMode::Filter)
+            .expect("a thread that `can_adopt` has approved");
     }
 
     /// Runs every filter the thread has installed against `data`, and returns
@@ -598,6 +688,92 @@ mod test {
         let child = SeccompState::new_from(&parent);
         assert_eq!(child.mode(), SeccompMode::Filter);
         assert_eq!(child.run_filters(&data(0)), SECCOMP_RET_ERRNO | 13);
+    }
+
+    #[ktest]
+    fn preparing_a_filter_does_not_install_it() {
+        // `prepare_attach` is what a caller that may still change its mind uses,
+        // so it must leave the thread exactly as it was. This is what lets
+        // `SECCOMP_FILTER_FLAG_TSYNC` turn down a group without having confined
+        // any of it.
+        let state = filtered(verdict(SECCOMP_RET_ALLOW));
+        let filter = state.prepare_attach(verdict(SECCOMP_RET_KILL_PROCESS));
+
+        assert!(filter.is_ok());
+        assert_eq!(state.run_filters(&data(0)), SECCOMP_RET_ALLOW);
+    }
+
+    #[ktest]
+    fn a_thread_without_a_filter_of_its_own_can_adopt_any_filter() {
+        // A thread that is not confined has nothing to lose, so it can be moved
+        // onto any chain, however long it is.
+        let caller = filtered(verdict(SECCOMP_RET_ALLOW));
+        let filter = caller
+            .prepare_attach(verdict(SECCOMP_RET_ERRNO | 13))
+            .unwrap();
+
+        let other = SeccompState::new();
+        assert!(other.can_adopt(&filter));
+    }
+
+    #[ktest]
+    fn a_thread_can_adopt_a_filter_installed_above_its_own() {
+        // The child forked before the parent installed its second filter, so
+        // the chain the child holds is a prefix of the one the parent has now.
+        // The new filter goes on top of the parent's chain, and the child's
+        // filters are still a prefix of the result, so the child can be moved.
+        let parent = filtered(verdict(SECCOMP_RET_ALLOW));
+        let child = SeccompState::new_from(&parent);
+        parent
+            .attach_filter(verdict(SECCOMP_RET_ERRNO | 13))
+            .unwrap();
+
+        let filter = parent
+            .prepare_attach(verdict(SECCOMP_RET_ERRNO | 1))
+            .unwrap();
+        assert!(child.can_adopt(&filter));
+
+        child.adopt_filter(&filter);
+        assert_eq!(child.mode(), SeccompMode::Filter);
+        assert_eq!(child.run_filters(&data(0)), SECCOMP_RET_ERRNO | 1);
+
+        // The thread that installed the filter is the last to be moved onto it,
+        // and only once every other thread has been: a caller that moves the
+        // others first can still turn back if one of them cannot be moved, as
+        // long as it has not moved itself. So building the filter has left the
+        // parent where it was, and the new verdict is the child's alone.
+        assert_eq!(parent.run_filters(&data(0)), SECCOMP_RET_ERRNO | 13);
+
+        parent.commit_attach(&filter).unwrap();
+        assert_eq!(parent.run_filters(&data(0)), SECCOMP_RET_ERRNO | 1);
+    }
+
+    #[ktest]
+    fn a_thread_cannot_adopt_a_filter_that_does_not_reach_back_to_its_own() {
+        // Two threads that each installed a filter of their own hold two
+        // different filters, even though the programs in them are equal: a
+        // filter is only shared with a thread that forked from the one that
+        // installed it. Moving either onto the other's chain would take a
+        // filter away from it, which seccomp never does.
+        let caller = filtered(verdict(SECCOMP_RET_ALLOW));
+        let other = filtered(verdict(SECCOMP_RET_ALLOW));
+
+        let filter = caller
+            .prepare_attach(verdict(SECCOMP_RET_ERRNO | 13))
+            .unwrap();
+        assert!(!other.can_adopt(&filter));
+    }
+
+    #[ktest]
+    fn a_thread_in_the_strict_mode_cannot_adopt_a_filter() {
+        let caller = filtered(verdict(SECCOMP_RET_ALLOW));
+        let filter = caller
+            .prepare_attach(verdict(SECCOMP_RET_ERRNO | 13))
+            .unwrap();
+
+        let other = SeccompState::new();
+        assert!(other.set_mode(SeccompMode::Strict).is_ok());
+        assert!(!other.can_adopt(&filter));
     }
 
     #[ktest]

@@ -111,15 +111,29 @@ Unsupported operations:
 * `SECCOMP_GET_NOTIF_SIZES`, because the user-notification action whose
   structures it describes is not supported
 
+Supported filter flags:
+* `SECCOMP_FILTER_FLAG_TSYNC`, which confines every thread of the calling
+  thread's group rather than only the thread that installs the filter, and
+  `SECCOMP_FILTER_FLAG_TSYNC_ESRCH`, which reports a thread that could not be
+  confined as `ESRCH` rather than as the thread's id. A thread group is not
+  always one that can be confined, since a thread whose own filters the new one
+  would not be installed on top of cannot be moved onto it; when that is the
+  case, no thread is confined and the system call reports which thread stood in
+  the way.
+* `SECCOMP_FILTER_FLAG_SPEC_ALLOW`, which asks for the speculation barrier that
+  a filter would otherwise run behind to be left out. It is a hint about
+  performance rather than about what a filter does, and this kernel has no such
+  barrier to leave out.
+
 Unsupported filter flags:
-* `SECCOMP_FILTER_FLAG_TSYNC`, `SECCOMP_FILTER_FLAG_LOG` and
-  `SECCOMP_FILTER_FLAG_SPEC_ALLOW`
+* `SECCOMP_FILTER_FLAG_LOG`, `SECCOMP_FILTER_FLAG_NEW_LISTENER` and
+  `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`
 
   Rather than being ignored, every flag is refused with `EINVAL`, so that a
-  caller is never left believing that a filter does more than it does. The
-  first of the three is the one that matters: it is what a sandbox runtime
-  passes when it sets up a container, and without it a filter confines only the
-  thread that installs it.
+  caller is never left believing that a filter does more than it does. The first
+  would change what the kernel reports about the calls a filter lets through,
+  and the other two belong to the user-notification action, which is not
+  supported at all.
 
 Unsupported actions:
 * `SECCOMP_RET_LOG`, `SECCOMP_RET_TRACE` and `SECCOMP_RET_USER_NOTIF`
