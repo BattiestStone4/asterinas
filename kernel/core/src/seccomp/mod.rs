@@ -395,18 +395,37 @@ impl SeccompState {
     /// of, which is how `SECCOMP_FILTER_FLAG_TSYNC` confines the threads of a
     /// group with the filter one of them installed.
     ///
-    /// The caller has to have established with [`Self::can_adopt`] that this
-    /// thread is a thread that can be moved.
-    pub(crate) fn adopt_filter(&self, filter: &Arc<SeccompFilter>) {
-        *self.filters.lock() = Some(filter.clone());
+    /// Returns whether the thread was moved. The caller has to have established
+    /// with [`Self::can_adopt`] that this thread is one that can be moved, and
+    /// a thread that gained a filter in the meantime is still one: the question
+    /// and the move are put to the thread by the same caller, which holds the
+    /// lock that every seccomp operation takes for the whole of a sync.
+    ///
+    /// The question is asked again here rather than taken on trust, because the
+    /// answer a caller holds is one it got before it made any change, and a
+    /// thread that entered the strict mode in between is one that no filter can
+    /// be added to. Moving it anyway would leave it in a mode that holds a
+    /// filter it never runs; moving it without asking would take whatever
+    /// filter it installed in the meantime away from it.
+    pub(crate) fn adopt_filter(&self, filter: &Arc<SeccompFilter>) -> bool {
+        let mut filters = self.filters.lock();
+
+        if self.mode() == SeccompMode::Strict {
+            return false;
+        }
 
         // The chain is filled in before the mode is published here as well, for
         // the reason given in `commit_attach`.
-        //
-        // This cannot fail: the strict mode is the one mode `set_mode` turns
-        // down, and a thread in it is one that `can_adopt` refuses to move.
-        self.set_mode(SeccompMode::Filter)
-            .expect("a thread that `can_adopt` has approved");
+        *filters = Some(filter.clone());
+
+        // The strict mode is the one mode `set_mode` turns down and it has just
+        // been ruled out, so this always succeeds. A caller that reached here
+        // without asking is the one case where it would not, which is what the
+        // assertion is for.
+        let entered = self.set_mode(SeccompMode::Filter).is_ok();
+        debug_assert!(entered, "the strict mode was ruled out above");
+
+        true
     }
 
     /// Runs every filter the thread has installed against `data`, and returns
@@ -491,7 +510,7 @@ mod test {
     use ostd::prelude::*;
 
     use super::*;
-    use crate::seccomp::bpf::{BPF_MAXINSNS, JEQ_K, LD_W_ABS, RET_K};
+    use crate::seccomp::bpf::{JEQ_K, LD_W_ABS, RET_K};
 
     /// Writes an instruction out, so that a program reads as a list of them.
     fn insn(code: u16, jt: u8, jf: u8, k: u32) -> SockFilter {
@@ -756,7 +775,7 @@ mod test {
             .unwrap();
         assert!(child.can_adopt(&filter));
 
-        child.adopt_filter(&filter);
+        assert!(child.adopt_filter(&filter));
         assert_eq!(child.mode(), SeccompMode::Filter);
         assert_eq!(child.run_filters(&data(0)), SECCOMP_RET_ERRNO | 1);
 
@@ -797,6 +816,30 @@ mod test {
         let other = SeccompState::new();
         assert!(other.set_mode(SeccompMode::Strict).is_ok());
         assert!(!other.can_adopt(&filter));
+    }
+
+    #[ktest]
+    fn a_thread_that_entered_the_strict_mode_is_not_moved_onto_a_filter() {
+        // A sync asks whether a thread can be moved before it moves any thread,
+        // so a thread can be one it approved and stop being one afterwards.
+        // Moving it anyway would put a filter in the chain of a thread that is
+        // in a mode that never runs one, and would do it by way of a path that
+        // has no answer for the thread it could not move.
+        let caller = filtered(verdict(SECCOMP_RET_ALLOW));
+        let filter = caller
+            .prepare_attach(verdict(SECCOMP_RET_ERRNO | 13))
+            .unwrap();
+
+        let other = SeccompState::new();
+        assert!(other.can_adopt(&filter));
+
+        assert!(other.set_mode(SeccompMode::Strict).is_ok());
+        assert!(!other.adopt_filter(&filter));
+
+        // The thread is left exactly as it was, rather than holding a filter it
+        // never runs.
+        assert_eq!(other.mode(), SeccompMode::Strict);
+        assert!(other.filters.lock().is_none());
     }
 
     #[ktest]

@@ -144,6 +144,14 @@ pub(super) fn sys_seccomp(
 /// the thread may do. See
 /// <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/seccomp.c>.
 pub(crate) fn enter_strict_mode(ctx: &Context) -> Result<()> {
+    // Every seccomp operation of the process takes this lock, so that one of
+    // them cannot be overtaken by another. Entering the strict mode is an
+    // operation a sync has to be able to rule out: a thread that did it between
+    // the sync asking whether the thread can take a filter and the sync giving
+    // it one is a thread the filter cannot be added to. The lock is what keeps
+    // the answer to that question good; see `confine_thread_group`.
+    let _tasks = ctx.process.tasks().lock();
+
     ctx.posix_thread.seccomp().set_mode(SeccompMode::Strict)
 }
 
@@ -196,6 +204,13 @@ pub(crate) fn install_filter(ctx: &Context, flags: u32, fprog_addr: Vaddr) -> Re
     let program = verify(program)?;
 
     if flags & SECCOMP_FILTER_FLAG_TSYNC == 0 {
+        // Held for the reason given in `enter_strict_mode`, and for one more:
+        // the filter is built and installed under the same lock, so a sync that
+        // runs in between cannot have a filter built against a chain the caller
+        // then replaces with one that does not reach back to it. See
+        // `SeccompState::prepare_attach`.
+        let _tasks = ctx.process.tasks().lock();
+
         ctx.posix_thread.seccomp().attach_filter(program)?;
         return Ok(0);
     }
@@ -209,10 +224,18 @@ pub(crate) fn install_filter(ctx: &Context, flags: u32, fprog_addr: Vaddr) -> Re
 fn confine_thread_group(ctx: &Context, program: Program, report_esrch: bool) -> Result<isize> {
     let seccomp = ctx.posix_thread.seccomp();
 
-    // The group's list of threads is held from here to the end of the sync: a
-    // thread created while this runs would be one that the checks below never
-    // saw, and it would come into being unconfined. Linux holds the lock that
-    // guards the same thing for the same reason.
+    // The lock is held from here to the end of the sync, and every seccomp
+    // operation of the process takes it, so no thread can change its own
+    // seccomp state while the group is being examined: the two passes below,
+    // which ask whether each thread can be moved and then move it, are one
+    // change to the group rather than two. Linux holds `sighand->siglock` for
+    // the same span and for the same reason.
+    //
+    // A thread that is being cloned while this runs is the one thread that is
+    // not covered. `clone_child_task` takes the child's seccomp state and
+    // starts the child before it registers it here, so a child of a thread
+    // that this sync confines can come into being with the state its parent had
+    // when the clone began, and nothing adds the filter to it afterwards.
     let tasks = ctx.process.tasks().lock();
 
     // The filter is built before any thread is looked at. The checks it makes
@@ -278,7 +301,14 @@ fn confine_thread_group(ctx: &Context, program: Program, report_esrch: bool) -> 
             continue;
         }
 
-        thread.seccomp().adopt_filter(&filter);
+        // The lock has been held across both passes, so a thread that
+        // `can_adopt` approved above is still one that can be moved here, and
+        // the filter is not one that has to be taken back.
+        let moved = thread.seccomp().adopt_filter(&filter);
+        debug_assert!(
+            moved,
+            "a thread that `can_adopt` approved could not be moved"
+        );
 
         // A thread that holds a filter without having made the promise could
         // exec a program that gains privileges, which is what the promise is
