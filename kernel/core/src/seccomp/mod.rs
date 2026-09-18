@@ -202,6 +202,29 @@ pub(crate) struct SeccompFilter {
     prev: Option<Arc<SeccompFilter>>,
 }
 
+impl Drop for SeccompFilter {
+    fn drop(&mut self) {
+        // The chain is taken apart a node at a time rather than by letting the
+        // node in front free the one behind it, which would need a stack frame
+        // per filter: a chain can hold thousands of them, and the frames alone
+        // would be more than a kernel stack has room for. Linux frees a chain
+        // iteratively for the same reason.
+        let mut next = self.prev.take();
+        while let Some(filter) = next {
+            // A node that another thread still holds is left where it is, and
+            // the chain behind it with it: the count is what says whether this
+            // is the thread that frees it.
+            match Arc::try_unwrap(filter) {
+                // Taking the chain out first leaves the node with nothing to
+                // free when it goes out of scope here, so this stays a loop
+                // rather than becoming a recursion again.
+                Ok(mut filter) => next = filter.prev.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 /// Returns whether `parent` is one of the filters on the chain that `child`
 /// names.
 ///
@@ -774,6 +797,36 @@ mod test {
         let other = SeccompState::new();
         assert!(other.set_mode(SeccompMode::Strict).is_ok());
         assert!(!other.can_adopt(&filter));
+    }
+
+    #[ktest]
+    fn a_chain_of_filters_is_freed_without_a_stack_frame_per_filter() {
+        // A chain holds as many filters as the instruction budget allows, which
+        // is thousands of them, and freeing it has to cost the same whatever
+        // its length. Letting each node free the one behind it would need a
+        // frame per filter and take more stack than a kernel stack has; this
+        // overflows the stack rather than failing an assertion if the freeing
+        // is not iterative.
+        //
+        // The chain is built a node at a time here rather than by installing
+        // filters, because `prepare_attach` walks the whole chain to count its
+        // instructions and so costs more the longer the chain gets, while what
+        // is being tested is the freeing.
+        let count = MAX_INSNS_PER_PATH / (1 + INSN_PENALTY_PER_FILTER);
+        let program = || Program::new(vec![insn(RET_K, 0, 0, SECCOMP_RET_ALLOW)]);
+
+        let mut chain = Arc::new(SeccompFilter {
+            program: program(),
+            prev: None,
+        });
+        for _ in 1..count {
+            chain = Arc::new(SeccompFilter {
+                program: program(),
+                prev: Some(chain),
+            });
+        }
+
+        drop(chain);
     }
 
     #[ktest]
